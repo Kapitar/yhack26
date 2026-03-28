@@ -61,6 +61,11 @@ export default function App() {
           Acquiring GPS…
         </div>
       )}
+      {position && (
+        <div style={{ fontFamily: 'monospace', fontSize: 11, padding: '2px 8px', background: '#111', color: '#0f0' }}>
+          lat: {position.lat.toFixed(6)} lng: {position.lng.toFixed(6)} acc: {position.accuracy?.toFixed(0)}m
+        </div>
+      )}
 
       {/* Map — always visible */}
       <div className={`map-wrapper ${isNavigating ? 'map-navigating' : ''}`}>
