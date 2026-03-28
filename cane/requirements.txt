@@ -1,5 +1,6 @@
 opencv-python
 numpy
 ultralytics
-bleak
 websockets
+pyserial
+pyrealsense2
