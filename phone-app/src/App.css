@@ -1,0 +1,255 @@
+/* ── Reset / base ── */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --bg: #0a0a0a;
+  --surface: #161616;
+  --surface2: #1f1f1f;
+  --border: #2a2a2a;
+  --primary: #3b82f6;
+  --primary-dark: #1d4ed8;
+  --danger: #ef4444;
+  --success: #22c55e;
+  --text: #f1f5f9;
+  --text-muted: #94a3b8;
+  --font: system-ui, -apple-system, sans-serif;
+}
+
+html, body, #root {
+  height: 100%;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font);
+  -webkit-font-smoothing: antialiased;
+}
+
+/* ── App layout ── */
+.app {
+  display: flex;
+  flex-direction: column;
+  height: 100dvh; /* dynamic viewport height — handles iOS bar */
+  overflow: hidden;
+}
+
+/* ── Header ── */
+.header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 16px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  z-index: 10;
+  flex-shrink: 0;
+}
+
+.logo {
+  font-size: 1.25rem;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  color: var(--primary);
+}
+
+/* ── Status bar ── */
+.status-bar {
+  padding: 8px 16px;
+  font-size: 0.8rem;
+  background: var(--surface2);
+  color: var(--text-muted);
+  text-align: center;
+  flex-shrink: 0;
+}
+.status-bar.error {
+  background: rgba(239, 68, 68, 0.15);
+  color: #fca5a5;
+}
+
+/* ── Map ── */
+.map-wrapper {
+  flex: 1;
+  min-height: 0;
+  transition: flex 0.3s ease;
+}
+.map-wrapper.map-navigating {
+  flex: 0 0 52%;
+}
+
+/* ── Bottom panel ── */
+.bottom-panel {
+  flex-shrink: 0;
+  background: var(--surface);
+  border-top: 1px solid var(--border);
+}
+
+/* ── Destination search ── */
+.search-container {
+  padding: 16px;
+  position: relative;
+}
+
+.search-input {
+  width: 100%;
+  padding: 14px 16px;
+  font-size: 1rem;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  color: var(--text);
+  outline: none;
+  transition: border-color 0.2s;
+}
+.search-input:focus {
+  border-color: var(--primary);
+}
+.search-input:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.search-hint {
+  padding: 8px 4px 0;
+  font-size: 0.8rem;
+  color: var(--text-muted);
+}
+.search-hint.error { color: #fca5a5; }
+
+.search-results {
+  list-style: none;
+  margin-top: 8px;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  overflow: hidden;
+  max-height: 240px;
+  overflow-y: auto;
+}
+
+.search-result-item {
+  padding: 14px 16px;
+  font-size: 0.9rem;
+  cursor: pointer;
+  border-bottom: 1px solid var(--border);
+  color: var(--text);
+  transition: background 0.15s;
+}
+.search-result-item:last-child { border-bottom: none; }
+.search-result-item:hover,
+.search-result-item:focus {
+  background: var(--border);
+  outline: none;
+}
+
+/* ── Navigation panel ── */
+.nav-panel {
+  padding: 20px 20px 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.nav-top {
+  display: flex;
+  align-items: center;
+  gap: 20px;
+}
+
+.nav-arrow {
+  font-size: 4rem;
+  line-height: 1;
+  color: var(--primary);
+  transition: transform 0.4s ease;
+  flex-shrink: 0;
+  width: 72px;
+  text-align: center;
+}
+
+.nav-info {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.nav-distance {
+  font-size: 2rem;
+  font-weight: 700;
+  line-height: 1;
+}
+
+.nav-bearing {
+  font-size: 0.9rem;
+  color: var(--text-muted);
+}
+
+.nav-progress-track {
+  height: 6px;
+  background: var(--border);
+  border-radius: 3px;
+  overflow: hidden;
+}
+.nav-progress-fill {
+  height: 100%;
+  background: var(--primary);
+  border-radius: 3px;
+  transition: width 0.5s ease;
+}
+
+.arrived-text {
+  font-size: 1.5rem;
+  font-weight: 700;
+  text-align: center;
+  color: var(--success);
+}
+
+/* ── Buttons ── */
+.btn-stop {
+  width: 100%;
+  padding: 16px;
+  font-size: 1rem;
+  font-weight: 600;
+  background: var(--danger);
+  color: #fff;
+  border: none;
+  border-radius: 12px;
+  cursor: pointer;
+  transition: opacity 0.15s;
+}
+.btn-stop:active { opacity: 0.8; }
+
+/* ── Bluetooth pill ── */
+.ble-pill {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  border-radius: 20px;
+  font-size: 0.8rem;
+  font-weight: 500;
+  border: none;
+  cursor: pointer;
+  transition: opacity 0.15s;
+}
+.ble-pill:active { opacity: 0.7; }
+
+.ble-connected {
+  background: rgba(34, 197, 94, 0.15);
+  color: var(--success);
+}
+.ble-disconnected {
+  background: var(--surface2);
+  color: var(--text-muted);
+}
+
+.ble-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: currentColor;
+}
+.ble-connected .ble-dot {
+  animation: pulse 2s infinite;
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0.4; }
+}
