@@ -68,11 +68,13 @@ class MiniAutoBLE:
         device_name: str = DEVICE_NAME,
         imu_callback: Optional[Callable[[ImuReading], None]] = None,
     ):
-        self._device_name   = device_name
-        self._imu_callback  = imu_callback
+        self._device_name    = device_name
+        self._imu_callback   = imu_callback
         self._client: Optional[BleakClient] = None
-        self._latest_imu    = ImuReading()
-        self._rx_buf        = ""
+        self._latest_imu     = ImuReading()
+        self._rx_buf         = ""
+        self._write_handle   = None   # characteristic handle for sending commands
+        self._notify_handle  = None   # characteristic handle for receiving IMU data
 
     # ── Connection ────────────────────────────────────────────────────────────
 
@@ -85,21 +87,57 @@ class MiniAutoBLE:
             raise RuntimeError(
                 f"BLE device '{self._device_name}' not found. "
                 "Make sure the miniAuto is powered on and in range.\n"
-                "Run: python -m cane.ble_driver scan  to list nearby devices."
+                "Run: python cane\\ble_driver.py scan  to list nearby devices."
             )
 
         self._client = BleakClient(device)
         await self._client.connect()
         logger.info(f"Connected to {device.name} ({device.address})")
 
-        # Subscribe to notifications (IMU data from Arduino)
-        await self._client.start_notify(CHAR_UUID, self._on_notify)
-        logger.info("Subscribed to IMU notifications")
+        # The HM-10 exposes two characteristics with the same FFE1 UUID:
+        # one supports Write/WriteWithoutResponse, the other supports Notify.
+        # Select each by its properties using the handle to avoid UUID ambiguity.
+        all_chars = [
+            c
+            for service in self._client.services
+            for c in service.characteristics
+            if c.uuid.lower() == CHAR_UUID.lower()
+        ]
+        logger.info(f"Found {len(all_chars)} FFE1 characteristic(s):")
+        for c in all_chars:
+            logger.info(f"  handle={c.handle}  properties={c.properties}")
+
+        for c in all_chars:
+            props = set(c.properties)
+            if "notify" in props and self._notify_handle is None:
+                self._notify_handle = c.handle
+            if ("write-without-response" in props or "write" in props) \
+                    and self._write_handle is None:
+                self._write_handle = c.handle
+
+        # If both roles share the same characteristic (single-char HM-10 variants)
+        if self._notify_handle is None and self._write_handle is not None:
+            self._notify_handle = self._write_handle
+        if self._write_handle is None and self._notify_handle is not None:
+            self._write_handle = self._notify_handle
+
+        if self._notify_handle is None:
+            raise RuntimeError(
+                "Could not find a usable FFE1 characteristic. "
+                "Check that the miniAuto firmware is flashed correctly."
+            )
+
+        await self._client.start_notify(self._notify_handle, self._on_notify)
+        logger.info(
+            f"Ready — write handle={self._write_handle}, "
+            f"notify handle={self._notify_handle}"
+        )
 
     async def disconnect(self) -> None:
         if self._client and self._client.is_connected:
-            await self._send_raw(b"S\n")   # stop motors before disconnecting
-            await self._client.stop_notify(CHAR_UUID)
+            await self._send_raw(b"S\n")
+            if self._notify_handle is not None:
+                await self._client.stop_notify(self._notify_handle)
             await self._client.disconnect()
             logger.info("Disconnected from miniAuto")
 
@@ -164,9 +202,8 @@ class MiniAutoBLE:
 
     async def _send_raw(self, data: bytes) -> None:
         """Write bytes to the BLE characteristic (→ Arduino Serial)."""
-        if self._client and self._client.is_connected:
-            # HM-10 write-without-response is more reliable for streaming
-            await self._client.write_gatt_char(CHAR_UUID, data, response=False)
+        if self._client and self._client.is_connected and self._write_handle:
+            await self._client.write_gatt_char(self._write_handle, data, response=False)
 
     def _on_notify(self, sender, data: bytearray) -> None:
         """BLE notification callback — called on bleak's internal thread."""
