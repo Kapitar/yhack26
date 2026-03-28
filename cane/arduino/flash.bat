@@ -16,10 +16,13 @@ REM ── Check / install arduino-cli ─────────────�
 where arduino-cli >nul 2>&1
 if errorlevel 1 (
     echo arduino-cli not found. Downloading...
-    powershell -Command "Invoke-WebRequest -Uri https://downloads.arduino.cc/arduino-cli/arduino-cli_latest_Windows_64bit.zip -OutFile arduino-cli.zip"
-    powershell -Command "Expand-Archive arduino-cli.zip -DestinationPath ."
-    del arduino-cli.zip
-    set PATH=%PATH%;%~dp0
+    powershell -Command "Invoke-WebRequest -Uri https://downloads.arduino.cc/arduino-cli/arduino-cli_latest_Windows_64bit.zip -OutFile '%~dp0arduino-cli.zip'"
+    powershell -Command "Expand-Archive '%~dp0arduino-cli.zip' -DestinationPath '%~dp0'"
+    del "%~dp0arduino-cli.zip"
+    REM Add arduino-cli location to PATH using delayed expansion to avoid
+    REM parenthesis collision with NVIDIA/CUDA paths in %PATH%
+    set "EXTRA_PATH=%~dp0"
+    set "PATH=!EXTRA_PATH!;!PATH!"
 )
 
 REM ── Install AVR core if missing ───────────────────────────────────────────────
