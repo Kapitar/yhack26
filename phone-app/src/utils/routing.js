@@ -1,6 +1,7 @@
 // Self-hosted Valhalla for pedestrian routing.
 // Change VALHALLA_BASE if your instance runs on a different host/port.
-const VALHALLA_BASE = 'http://vpn.artem-kim.com:8002';
+// Proxied through Vite dev server to avoid CORS — see vite.config.js
+const VALHALLA_BASE = '/valhalla';
 const NOMINATIM_BASE = 'https://nominatim.openstreetmap.org';
 
 /**
