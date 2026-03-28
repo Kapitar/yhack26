@@ -2,10 +2,10 @@ import { useState } from 'react';
 import Map from './components/Map.jsx';
 import DestinationSearch from './components/DestinationSearch.jsx';
 import NavPanel from './components/NavPanel.jsx';
-import BluetoothStatus from './components/BluetoothStatus.jsx';
+import ConnectionStatus from './components/ConnectionStatus.jsx';
 import { useGPS } from './hooks/useGPS.js';
 import { useNavigation } from './hooks/useNavigation.js';
-import { useBluetooth } from './hooks/useBluetooth.js';
+import { useWebSocket } from './hooks/useWebSocket.js';
 
 export default function App() {
   const { position, error: gpsError } = useGPS();
@@ -17,15 +17,23 @@ export default function App() {
     startNavigation,
     stopNavigation,
   } = useNavigation(position);
-  const { connected, connect, disconnect, sendBearing } = useBluetooth();
+  const {
+    connected,
+    error: wsError,
+    wsUrl,
+    serverStatus,
+    connect,
+    disconnect,
+    sendNav,
+  } = useWebSocket();
 
   const [destination, setDestination] = useState(null);
 
   const isNavigating = status === 'navigating' || status === 'arrived' || status === 'routing';
 
-  // Forward bearing to cane whenever navState updates
+  // Stream nav data to laptop every time navState or position updates
   if (navState && connected) {
-    sendBearing(navState.bearing);
+    sendNav(navState, position);
   }
 
   function handleDestinationSelect(result) {
@@ -43,14 +51,17 @@ export default function App() {
       {/* Header */}
       <header className="header">
         <span className="logo">LeadMe</span>
-        <BluetoothStatus
+        <ConnectionStatus
           connected={connected}
+          wsUrl={wsUrl}
+          error={wsError}
+          serverStatus={serverStatus}
           onConnect={connect}
           onDisconnect={disconnect}
         />
       </header>
 
-      {/* GPS status bar */}
+      {/* Status bars */}
       {(gpsError || navError) && (
         <div className="status-bar error" role="alert">
           {gpsError || navError}
@@ -64,6 +75,7 @@ export default function App() {
       {position && (
         <div style={{ fontFamily: 'monospace', fontSize: 11, padding: '2px 8px', background: '#111', color: '#0f0' }}>
           lat: {position.lat.toFixed(6)} lng: {position.lng.toFixed(6)} acc: {position.accuracy?.toFixed(0)}m
+          {position.heading != null ? `  hdg: ${position.heading.toFixed(0)}°` : '  hdg: —'}
         </div>
       )}
 
