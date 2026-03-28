@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+venv/
+.venv/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+
+# YOLO / ML models (large binaries — store in releases or DVC)
+*.pt
+*.onnx
+*.tflite
+*.weights
+
+# Node / phone-app
+phone-app/node_modules/
+phone-app/dist/
+phone-app/.vite/
+
+# macOS
+.DS_Store
+.AppleDouble
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Env / secrets
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+npm-debug.log*
+CLAUDE.md
