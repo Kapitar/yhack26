@@ -279,14 +279,19 @@ class MiniAutoBLESync:
 async def _scan():
     """List nearby BLE devices to find your HM-10 module's name/address."""
     print("Scanning for BLE devices (10 seconds)...\n")
-    devices = await BleakScanner.discover(timeout=10.0)
-    if not devices:
+    # return_adv=True gives (BLEDevice, AdvertisementData) pairs — RSSI lives in adv data
+    results = await BleakScanner.discover(timeout=10.0, return_adv=True)
+    if not results:
         print("No devices found.")
         return
     print(f"{'Name':<30} {'Address':<20} RSSI")
     print("-" * 60)
-    for d in sorted(devices, key=lambda x: x.rssi or -999, reverse=True):
-        print(f"{(d.name or 'Unknown'):<30} {d.address:<20} {d.rssi} dBm")
+    entries = [
+        (dev.name or "Unknown", dev.address, adv.rssi or -999)
+        for dev, adv in results.values()
+    ]
+    for name, address, rssi in sorted(entries, key=lambda x: x[2], reverse=True):
+        print(f"{name:<30} {address:<20} {rssi} dBm")
     print(f"\nSet DEVICE_NAME in ble_driver.py to match your module's name.")
 
 
