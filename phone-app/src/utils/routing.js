@@ -52,8 +52,10 @@ export async function fetchRoute(from, to) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
   });
-  if (!res.ok) throw new Error('Routing request failed');
-  const data = await res.json();
+  const data = await res.json().catch(() => null);
+  if (!res.ok) {
+    throw new Error(data?.error ?? `Valhalla error ${res.status}`);
+  }
   if (data.trip?.status !== 0) throw new Error(data.trip?.status_message ?? 'No route found');
 
   return decodePolyline6(data.trip.legs[0].shape);
