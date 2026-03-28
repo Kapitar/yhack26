@@ -36,7 +36,7 @@ CHAR_UUID    = "0000FFE1-0000-1000-8000-00805F9B34FB"
 
 # Device name advertised by the HM-10 module (default: "HMSoft" or "BT05")
 # Change this to match your module's advertised name.
-DEVICE_NAME  = "HMSoft"
+DEVICE_NAME  = "Hiwonder"
 
 ACCEL_SCALE  = 16384.0   # raw → g  (±2g range)
 GYRO_SCALE   = 131.0     # raw → °/s (±250°/s range)
