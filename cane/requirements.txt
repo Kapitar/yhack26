@@ -1,0 +1,6 @@
+opencv-python
+numpy
+ultralytics
+websockets
+pyserial
+pyrealsense2

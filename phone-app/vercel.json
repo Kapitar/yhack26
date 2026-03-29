@@ -1,0 +1,8 @@
+{
+  "rewrites": [
+    {
+      "source": "/valhalla/:path*",
+      "destination": "http://vpn.artem-kim.com:8002/:path*"
+    }
+  ]
+}
