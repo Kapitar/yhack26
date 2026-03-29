@@ -1,0 +1,12 @@
+pyrealsense2
+ultralytics
+opencv-python
+pyserial
+matplotlib
+numpy
+requests
+staticmap
+Pillow
+sounddevice
+soundfile
+pygame
