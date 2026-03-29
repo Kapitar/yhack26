@@ -261,6 +261,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="LeadMe laptop main process")
     parser.add_argument("--device", default="Hiwonder",
                         help="BLE device name to connect to (default: Hiwonder)")
+    args = parser.parse_args()
 
     try:
         asyncio.run(_async_main(args))
