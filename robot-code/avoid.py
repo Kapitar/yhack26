@@ -241,7 +241,39 @@ class MapViewer:
 
     # ── main thread ───────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _transcribe(audio_np, samplerate: int) -> str | None:
+        """Send audio to ElevenLabs scribe_v1 via lava.so and return transcript."""
+        import io as _io
+        import urllib.parse
+        import soundfile as sf
+
+        wav_buf = _io.BytesIO()
+        sf.write(wav_buf, audio_np, samplerate, format="WAV", subtype="PCM_16")
+        wav_buf.seek(0)
+
+        provider_url = "https://api.elevenlabs.io/v1/speech-to-text"
+        forward_url  = "https://api.lava.so/v1/forward?u=" + urllib.parse.quote(provider_url, safe="")
+
+        try:
+            resp = requests.post(
+                forward_url,
+                headers={"Authorization": f"Bearer {LAVA_API_KEY}"},
+                files={"file": ("audio.wav", wav_buf, "audio/wav")},
+                data={"model_id": "scribe_v1"},
+                timeout=20,
+            )
+            resp.raise_for_status()
+            return resp.json().get("text", "").strip()
+        except requests.HTTPError as e:
+            print(f"[map] STT error: {e} — {e.response.text}")
+        except Exception as e:
+            print(f"[map] STT error: {e}")
+        return None
+
     def _run(self):
+        import sounddevice as sd
+
         print("\n[map] detecting current location via IP …")
         loc_result = self._get_current_location()
         if loc_result:
@@ -252,14 +284,42 @@ class MapViewer:
             print("[map] could not auto-detect location — map disabled")
             return
 
-        print("[map] ready — type a destination in the terminal\n")
+        samplerate = 16000
+
+        print("[map] ready — press Enter to speak a destination\n")
         while True:
             try:
-                dest = input("Destination: ").strip()
+                input("[map] Press Enter to speak…")
             except EOFError:
                 break
-            if not dest:
+
+            print("[map] Listening… press Enter when done speaking")
+            chunks = []
+
+            def _cb(indata, frames, t, status):
+                chunks.append(indata.copy())
+
+            stream = sd.InputStream(samplerate=samplerate, channels=1,
+                                    dtype="int16", callback=_cb)
+            stream.start()
+            try:
+                input()
+            except EOFError:
+                pass
+            stream.stop()
+            stream.close()
+
+            if not chunks:
                 continue
+
+            audio_np = np.concatenate(chunks, axis=0).flatten()
+
+            print("[map] transcribing…")
+            dest = self._transcribe(audio_np, samplerate)
+            if not dest:
+                print("[map] could not understand — try again")
+                continue
+            print(f"[map] heard: \"{dest}\"")
 
             print(f"[map] geocoding '{dest}' …")
             end = self._geocode(dest)
