@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ipconfig)",
+      "Bash(netsh advfirewall:*)",
+      "WebFetch(domain:docs.hiwonder.com)"
+    ]
+  }
+}
