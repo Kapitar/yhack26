@@ -154,44 +154,6 @@ class SpeechWarner:
                 self._playing = False
 
 
-# ── Ledge detector ────────────────────────────────────────────────────────────
-
-class LedgeDetector:
-    """
-    Polls robot.latest_distance (written by Robot._io_loop) to detect ledges.
-    No serial access here — the Robot thread owns the port entirely.
-    """
-
-    LEDGE_THRESHOLD_CM = 20
-    HISTORY            = 5
-
-    def __init__(self, robot: "Robot", warner: "SpeechWarner"):
-        self._robot         = robot
-        self._warner        = warner
-        self._readings: list[float] = []
-        self.ledge_detected = False
-        threading.Thread(target=self._poll, daemon=True).start()
-
-    def _poll(self):
-        while True:
-            dist = self._robot.latest_distance
-            if dist is not None:
-                self._process(dist)
-            time.sleep(0.08)
-
-    def _process(self, dist: float):
-        if self._readings:
-            avg = sum(self._readings) / len(self._readings)
-            if dist - avg > self.LEDGE_THRESHOLD_CM:
-                self.ledge_detected = True
-                self._warner.warn()
-            else:
-                self.ledge_detected = False
-        self._readings.append(dist)
-        if len(self._readings) > self.HISTORY:
-            self._readings.pop(0)
-
-
 # ── Arduino serial ────────────────────────────────────────────────────────────
 
 def find_arduino() -> str | None:
@@ -213,52 +175,16 @@ class Robot:
         port = port or find_arduino()
         if port is None:
             raise RuntimeError("Arduino not found. Connect USB or pass --port.")
-        self._ser      = serial.Serial(port=port, baudrate=BAUD, timeout=0)  # non-blocking reads
+        self._ser  = serial.Serial(port=port, baudrate=BAUD, timeout=1)
         time.sleep(2.0)
         self._ser.reset_input_buffer()
-        self._lock     = threading.Lock()
-        self._angle    = 0
-        self._velocity = 0
-        self._rot      = 0
-        self._rx_buf   = ""
-        self.latest_distance: float | None = None   # updated by _io_loop
-        self._running  = True
-        threading.Thread(target=self._io_loop, daemon=True).start()
+        self._lock = threading.Lock()
         print(f"[robot] connected on {port}")
 
-    def _io_loop(self):
-        """Single thread that owns ALL serial I/O — writes commands, reads sensor data."""
-        interval = 1.0 / 50   # 50 Hz
-        while self._running:
-            t0 = time.monotonic()
-            with self._lock:
-                cmd = f"{self._angle % 360}|{max(0, min(100, self._velocity))}|{max(-100, min(100, self._rot))}\n"
-                self._ser.write(cmd.encode("ascii"))
-
-            # Drain incoming bytes (non-blocking)
-            try:
-                waiting = self._ser.in_waiting
-                if waiting:
-                    self._rx_buf += self._ser.read(waiting).decode("ascii", errors="ignore")
-                    while "\n" in self._rx_buf:
-                        line, self._rx_buf = self._rx_buf.split("\n", 1)
-                        line = line.strip()
-                        if line.startswith("D:"):
-                            try:
-                                self.latest_distance = float(line[2:])
-                            except ValueError:
-                                pass
-            except Exception:
-                pass
-
-            elapsed = time.monotonic() - t0
-            time.sleep(max(0, interval - elapsed))
-
     def _set(self, angle: int, velocity: int, rot: int):
+        cmd = f"{angle % 360}|{max(0, min(100, velocity))}|{max(-100, min(100, rot))}\n"
         with self._lock:
-            self._angle    = angle
-            self._velocity = velocity
-            self._rot      = rot
+            self._ser.write(cmd.encode("ascii"))
 
     def forward(self):   self._set(0,   DRIVE_SPEED,  0)
     def arc_left(self):  self._set(0,   ARC_SPEED,  -ARC_ROT)
@@ -266,13 +192,10 @@ class Robot:
     def backward(self):  self._set(180, BACK_SPEED,   0)
 
     def stop(self):
-        self._set(0, 0, 0)
         with self._lock:
             self._ser.write(b"S\n")
 
     def close(self):
-        self._running = False
-        time.sleep(0.1)
         self.stop()
         self._ser.close()
 
@@ -555,9 +478,7 @@ def main():
 
     model            = YOLO(args.model)
     robot            = Robot(args.port)
-    warner       = SpeechWarner("Stop!")
-    ledge_warner = SpeechWarner("Ledge detected!", interval_s=2.0)
-    ledge_det    = LedgeDetector(robot, ledge_warner)
+    warner = SpeechWarner("Stop!")
 
     pipeline = rs.pipeline()
     cfg = rs.config()
@@ -676,10 +597,6 @@ def main():
                             (0, 220,  80)
                 cv2.putText(frame, action, (10, fh - 15),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, txt_color, 2)
-
-                if ledge_det.ledge_detected:
-                    cv2.putText(frame, "⚠ LEDGE!", (fw - 160, 30),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
 
                 cv2.imshow("LeadMe Avoid", frame)
                 if cv2.waitKey(1) & 0xFF == ord("q"):
