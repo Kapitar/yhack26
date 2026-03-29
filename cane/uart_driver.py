@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 # ── Constants ─────────────────────────────────────────────────────────────────
 
 BAUD_RATE    = 9600
-SEND_HZ      = 50        # command rate for the keep-alive loop
+SEND_HZ      = 10        # command rate for the keep-alive loop
 TIMEOUT_S    = 1.0       # serial read timeout
 PING_TIMEOUT = 2.0       # seconds to wait for ping response
 

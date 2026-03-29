@@ -6,18 +6,19 @@ from ultralytics import YOLO
 
 # Import local UART driver for motor control
 from uart_driver import MiniAutoDriver
+# Import our new A* Path Planner
+from path_planner import PathPlanner
 
 logging.basicConfig(level=logging.INFO)
 
 # Configuration for Avoidance
-DANGER_ZONE_X_MIN = 200 # pixels (assuming 640 width)
-DANGER_ZONE_X_MAX = 440
-CRITICAL_DISTANCE = 0.4 # meters
-AVOID_DISTANCE = 1.2    # meters
-DEFAULT_SPEED = 60
+CRITICAL_DISTANCE = 0.5 # meters
+DEFAULT_SPEED = 100
+
+# Init Path Planner (Grid starts at robot: width 4m, height 4m, 10cm cells)
+planner = PathPlanner(width=4.0, height=4.0, resolution=0.1, inflation_radius=0.4)
 
 #you only look once model
-#a bigger model seems to be slower, keep using this model but maybe train more sign data onto it
 model = YOLO("yolov8n.pt")
 
 #connection to the camera
@@ -32,99 +33,118 @@ pipeline.start(config)
 align = rs.align(rs.stream.color)
 
 print("Starting Camera & Motor Driver...")
-# Connect to Arduino driver to control the motors
 with MiniAutoDriver() as driver:
-    print("Driver connected. Starting detection loop.")
+    print("Driver connected. Starting A* planning loop.")
     
     while True:
         #latest frames
         frames = pipeline.wait_for_frames()
-        #apply allied pixel for pixel
         aligned = align.process(frames)
         
-        #pullout color and depth frames (independently)
         color_frame = aligned.get_color_frame()
         depth_frame = aligned.get_depth_frame()
-        #if any frame missing, try again
         if not color_frame or not depth_frame:
             continue
 
-        #color to numpy array (grid of pixel values), work with OpenCV
         frame = np.asanyarray(color_frame.get_data())
-        #same w/ depth, each pixel is a value of distance (mm)
-        depth_image = np.asanyarray(depth_frame.get_data())
-
-        #yolo runs
         results = model(frame)
         
-        closest_distance = float('inf')
-        obstacle_cx = -1
         should_stop = False
+        planner.reset_map() # Clear last frame's grid
         
         #loop through all objects yolo detected
         for box in results[0].boxes:
-            #coordinates of the bounding box
             x1, y1, x2, y2 = map(int, box.xyxy[0])
-            #human readable label
             label = model.names[int(box.cls[0])]
-            #confidence score
             conf = float(box.conf[0])
             
-            #center point of box, use for depth calculation
+            # center point of box
             cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
-            #calculate actual distance
             distance = depth_frame.get_distance(cx, cy)
             
-            # RealSense returns 0.0 when depth sensing fails for a pixel (e.g. reflective surfaces)
-            # We should ignore 0.0 distances so the robot doesn't instantly panic/stop.
+            # RealSense invalid distance check
             if distance <= 0.01:
                 continue
                 
-            # Check if obstacle is in our front-facing safety zone
-            in_danger_zone = (DANGER_ZONE_X_MIN < cx < DANGER_ZONE_X_MAX)
-            color = (0, 255, 0)
+            # Emergency Stop Check
+            if distance < CRITICAL_DISTANCE and (200 < cx < 440):
+                should_stop = True
             
-            if in_danger_zone:
-                if distance < CRITICAL_DISTANCE:
-                    should_stop = True
-                    color = (0, 0, 255) # Red for critical
-                elif distance < AVOID_DISTANCE:
-                    color = (0, 165, 255) # Orange for warning
-                    if distance < closest_distance:
-                        closest_distance = distance
-                        obstacle_cx = cx
+            # MATH: Project pixel coordinates into physical meters (approx 87 deg H-FOV)
+            focal_length = 337.0 
+            world_X = ((cx - 320) / focal_length) * distance
+            world_Y = distance
             
-            # Draw box around object (green initially, red/orange if dangerous)
+            # Register on 2D mapping grid
+            planner.add_obstacle(world_X, world_Y)
+            
+            # Draw visual
+            color = (0, 0, 255) if distance < CRITICAL_DISTANCE else (255, 165, 0)
             cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-            # Box label, confidence, distance above the box
-            cv2.putText(frame, f"{label} {conf:.2f} | {distance:.2f}m", 
-                        (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+            cv2.putText(frame, f"{label} | X:{world_X:.1f} Y:{world_Y:.1f}m", 
+                        (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
 
-        # ======== MOTOR CONTROL LOGIC ========
+        # ======== MOTOR CONTROL LOGIC (A* + Pure Pursuit) ========
         
         if should_stop:
             driver.stop()
-            cv2.putText(frame, "STATE: STOP", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 3)
-        
-        elif closest_distance < AVOID_DISTANCE:
-            # We have an obstacle in the distance we need to avoid.
-            # Decide left or right based on which side the obstacle center is leaning towards.
-            # If obstacle center is left of the screen center (320), strafe right. Else, strafe left.
-            if obstacle_cx < 320:
-                driver.strafe_right(speed=DEFAULT_SPEED)
-                cv2.putText(frame, "STATE: EVADE RIGHT", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 165, 255), 3)
-            else:
-                driver.strafe_left(speed=DEFAULT_SPEED)
-                cv2.putText(frame, "STATE: EVADE LEFT", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 165, 255), 3)
-                
+            cv2.putText(frame, "STATE: EMERGENCY STOP", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 3)
         else:
-            # Path is clear, proceed forward safely!
-            driver.forward(speed=DEFAULT_SPEED)
-            cv2.putText(frame, "STATE: FORWARD", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 3)
-
-        # Draw Danger Zone lines on screen for visual debugging
-        cv2.line(frame, (DANGER_ZONE_X_MIN, 0), (DANGER_ZONE_X_MIN, 480), (255, 255, 255), 1)
-        cv2.line(frame, (DANGER_ZONE_X_MAX, 0), (DANGER_ZONE_X_MAX, 480), (255, 255, 255), 1)
+            # Plan path from robot (0,0) to target point 3 meters directly ahead (0, 3)
+            path = planner.astar(start_world=(0.0, 0.0), goal_world=(0.0, 3.0))
+            
+            if not path:
+                # No path found around objects -> blocked completely
+                driver.stop()
+                cv2.putText(frame, "STATE: PATH BLOCKED", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 3)
+            else:
+                # We have a mathematical trajectory! Feed to Pure Pursuit controller.
+                # Use SHORT lookahead (1.0m) to catch the curve EARLY, not overshoot it
+                target_angle = planner.pure_pursuit((0.0, 0.0), path, lookahead=1.0)
+                
+                # AMPLIFY the angle: A* produces subtle 5-15° deviations because the path
+                # only needs to shift ~0.5m sideways over 3m forward. But Mecanum wheels
+                # need 45°+ angles to produce visible lateral motion. Multiply by 4x.
+                amplified_angle = target_angle * 4.0
+                
+                # Clamp to max ±90° (pure lateral strafe)
+                amplified_angle = max(-90.0, min(90.0, amplified_angle))
+                
+                # Dead zone: if angle is tiny (<3°), just go straight — no jitter
+                if abs(amplified_angle) < 3.0:
+                    amplified_angle = 0.0
+                
+                # Dynamic speed: slow down if the curve is sharp
+                if abs(amplified_angle) > 45:
+                    vel = 60
+                else:
+                    vel = DEFAULT_SPEED
+                    
+                # Map to Arduino angle convention:
+                # Arduino: 0=Forward, 90=Left_Strafe, 270=Right_Strafe
+                # amplified_angle: negative=Left, positive=Right
+                if amplified_angle < 0: # Path is Left
+                    motor_angle = abs(amplified_angle)  # 0→90
+                else: # Path is Right  
+                    motor_angle = 360 - amplified_angle  # 270→360
+                    
+                driver.move(angle=int(motor_angle), velocity=int(vel), rot=0)
+                cv2.putText(frame, f"Raw:{target_angle:.1f} Amp:{amplified_angle:.1f} Motor:{int(motor_angle)}", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                
+                # Visualize Trajectory Line
+                if len(path) > 1:
+                    pixel_points = []
+                    for pt in path:
+                        wX, wY = pt[0], pt[1]
+                        if wY < 0.1: wY = 0.1 # Prevent div/0
+                        
+                        # Reverse project meters back into 2D camera pixels
+                        px = int((wX / wY) * 337.0 + 320)
+                        py = int(480 - (wY / 4.0) * 240) # map 4 meters to bottom half of height
+                        pixel_points.append((max(0, min(px, 639)), max(0, min(py, 479))))
+                        
+                    for i in range(1, len(pixel_points)):
+                        cv2.line(frame, pixel_points[i-1], pixel_points[i], (255, 0, 255), 6) # Thick Magenta line
 
         #show annotated frame in window on screen
         cv2.imshow("Cane Detection", frame)
