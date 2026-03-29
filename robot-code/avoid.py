@@ -22,11 +22,15 @@ Requires:
 """
 
 import argparse
+import io
+import tempfile
+import threading
 import time
 
 import cv2
 import numpy as np
 import pyrealsense2 as rs
+import requests
 import serial
 import serial.tools.list_ports
 from ultralytics import YOLO
@@ -54,11 +58,88 @@ OBSTACLE_CLASSES = None
 
 BAUD = 9600
 
+# ── Voice warning (ElevenLabs via lava.so) ────────────────────────────────────
+
+LAVA_API_KEY    = "aks_live_Xj5cToeOUuuLka5pePg_AFLp2Hsprn_C_mutwlSMEyve9M0i_K51P-n"
+LAVA_TTS_URL    = "https://api.lava.so/v1/text-to-speech/{voice_id}"
+ELEVENLABS_VOICE = "21m00Tcm4TlvDq8ikWAM"   # Rachel — change to any ElevenLabs voice ID
+WARN_INTERVAL_S = 1.5   # minimum seconds between successive "stop" warnings
+
 # Approximate RealSense focal length (pixels) at 640×480
 FOCAL_PX = 600.0
 
 # How many frames between 3-D plot refreshes (matplotlib is slow)
 PLOT_3D_EVERY = 6
+
+
+# ── Speech warning ───────────────────────────────────────────────────────────
+
+class SpeechWarner:
+    """
+    Calls lava.so ElevenLabs TTS to say 'stop' in a background thread.
+    Rate-limited to once every WARN_INTERVAL_S seconds.
+    """
+
+    def __init__(self):
+        self._last_warned = 0.0
+        self._lock        = threading.Lock()
+        self._playing     = False
+
+    def warn(self):
+        """Call this every frame when an obstacle is detected."""
+        now = time.monotonic()
+        with self._lock:
+            if self._playing:
+                return
+            if now - self._last_warned < WARN_INTERVAL_S:
+                return
+            self._last_warned = now
+            self._playing     = True
+
+        threading.Thread(target=self._speak, daemon=True).start()
+
+    def _speak(self):
+        try:
+            url  = LAVA_TTS_URL.format(voice_id=ELEVENLABS_VOICE)
+            resp = requests.post(
+                url,
+                headers={
+                    "xi-api-key":   LAVA_API_KEY,
+                    "Content-Type": "application/json",
+                    "Accept":       "audio/mpeg",
+                },
+                json={
+                    "text":     "Stop!",
+                    "model_id": "eleven_monolingual_v1",
+                    "voice_settings": {"stability": 0.4, "similarity_boost": 0.8},
+                },
+                timeout=8,
+            )
+            resp.raise_for_status()
+
+            # Write mp3 to a temp file and play with the OS audio player
+            with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
+                f.write(resp.content)
+                tmp_path = f.name
+
+            import subprocess, platform
+            system = platform.system()
+            if system == "Darwin":
+                subprocess.run(["afplay", tmp_path], check=True)
+            elif system == "Linux":
+                subprocess.run(["mpg123", "-q", tmp_path], check=True)
+            else:  # Windows
+                import winsound
+                winsound.PlaySound(tmp_path, winsound.SND_FILENAME)
+
+            import os
+            os.unlink(tmp_path)
+
+        except Exception as e:
+            print(f"[speech] warning: {e}")
+        finally:
+            with self._lock:
+                self._playing = False
 
 
 # ── Arduino serial ────────────────────────────────────────────────────────────
@@ -380,8 +461,9 @@ def main():
     parser.add_argument("--model",      default="yolov8n.pt")
     args = parser.parse_args()
 
-    model = YOLO(args.model)
-    robot = Robot(args.port)
+    model  = YOLO(args.model)
+    robot  = Robot(args.port)
+    warner = SpeechWarner()
 
     pipeline = rs.pipeline()
     cfg = rs.config()
@@ -467,6 +549,7 @@ def main():
                 robot.backward()
                 action = "BACK UP"
             elif obstacle_ahead:
+                warner.warn()
                 left_dist  = zone_distance(depth_f, 0.0,        LEFT_END)
                 right_dist = zone_distance(depth_f, RIGHT_START, 1.0)
                 if left_dist >= right_dist:
