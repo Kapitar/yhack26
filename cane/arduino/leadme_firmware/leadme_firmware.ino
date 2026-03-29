@@ -185,7 +185,7 @@ void setup() {
         pinMode(PWM_PIN[i], OUTPUT);
     }
     stop_motors();
-    Serial.begin(115200);
+    Serial.begin(9600);
     pid_reset();
     last_cmd_ms = millis();
 }
