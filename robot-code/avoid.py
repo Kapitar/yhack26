@@ -78,22 +78,23 @@ PLOT_3D_EVERY = 6
 
 class SpeechWarner:
     """
-    Calls lava.so ElevenLabs TTS to say 'stop' in a background thread.
-    Rate-limited to once every WARN_INTERVAL_S seconds.
+    Calls lava.so ElevenLabs TTS in a background thread.
+    Rate-limited per instance so obstacle and sidewalk warnings don't collide.
     """
 
-    def __init__(self):
+    def __init__(self, message: str, interval_s: float = WARN_INTERVAL_S):
+        self._message     = message
+        self._interval_s  = interval_s
         self._last_warned = 0.0
         self._lock        = threading.Lock()
         self._playing     = False
 
     def warn(self):
-        """Call this every frame when an obstacle is detected."""
         now = time.monotonic()
         with self._lock:
             if self._playing:
                 return
-            if now - self._last_warned < WARN_INTERVAL_S:
+            if now - self._last_warned < self._interval_s:
                 return
             self._last_warned = now
             self._playing     = True
@@ -104,7 +105,6 @@ class SpeechWarner:
         try:
             import urllib.parse
 
-            # Target ElevenLabs URL, URL-encoded for the ?u= param
             provider_url = (
                 f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE}"
             )
@@ -121,7 +121,7 @@ class SpeechWarner:
                     "Accept":        "audio/mpeg",
                 },
                 json={
-                    "text":     "Stop!",
+                    "text":     self._message,
                     "model_id": "eleven_flash_v2",
                     "voice_settings": {"stability": 0.4, "similarity_boost": 0.8},
                 },
@@ -152,6 +152,84 @@ class SpeechWarner:
         finally:
             with self._lock:
                 self._playing = False
+
+
+# ── Sidewalk detector ────────────────────────────────────────────────────────
+
+class SidewalkDetector:
+    """
+    Uses SegFormer trained on Cityscapes to detect whether the cane tip area
+    is still on the sidewalk. Runs every SIDEWALK_CHECK_EVERY frames.
+
+    Cityscapes class IDs:
+        0 = road   1 = sidewalk   2 = building  ...
+    """
+
+    SIDEWALK_ID   = 1
+    ROAD_ID       = 0
+    SAFE_IDS      = {0, 1}          # road + sidewalk both count as "safe ground"
+    MIN_RATIO     = 0.25            # tip ROI must be ≥25% safe ground to stay "on"
+    MODEL_NAME    = "nvidia/segformer-b0-finetuned-cityscapes-512-1024"
+
+    def __init__(self):
+        print("[sidewalk] loading SegFormer model …")
+        from transformers import SegformerForSemanticSegmentation, SegformerImageProcessor
+        import torch
+        self._torch     = torch
+        self._processor = SegformerImageProcessor.from_pretrained(self.MODEL_NAME)
+        self._model     = SegformerForSemanticSegmentation.from_pretrained(self.MODEL_NAME)
+        self._model.eval()
+        self.on_sidewalk = True       # latest verdict
+        self.mask        = None       # latest (H, W) uint8 overlay image
+        print("[sidewalk] model ready")
+
+    def update(self, frame: np.ndarray):
+        """Run inference and update self.on_sidewalk + self.mask."""
+        import torch.nn.functional as F
+
+        inputs = self._processor(images=frame, return_tensors="pt")
+        with self._torch.no_grad():
+            logits = self._model(**inputs).logits   # (1, 19, H/4, W/4)
+
+        # Upsample to original frame size
+        up = F.interpolate(logits, size=frame.shape[:2],
+                           mode="bilinear", align_corners=False)
+        pred = up.argmax(dim=1).squeeze().numpy()   # (H, W)
+
+        fh, fw = pred.shape
+
+        # Build colour overlay: sidewalk=green, road=blue, other=transparent
+        overlay = np.zeros((fh, fw, 3), dtype=np.uint8)
+        overlay[pred == self.SIDEWALK_ID] = (0, 200, 80)
+        overlay[pred == self.ROAD_ID]     = (200, 120, 0)
+        self.mask = overlay
+
+        # Check the "cane tip" region: bottom-centre strip
+        tip = pred[int(fh * 0.72):, int(fw * 0.3):int(fw * 0.7)]
+        safe_ratio = np.isin(tip, list(self.SAFE_IDS)).mean()
+        self.on_sidewalk = safe_ratio >= self.MIN_RATIO
+
+    def draw_overlay(self, frame: np.ndarray, alpha: float = 0.35) -> np.ndarray:
+        """Blend the segmentation mask onto frame and draw status text."""
+        if self.mask is None:
+            return frame
+
+        blended = cv2.addWeighted(self.mask, alpha, frame, 1 - alpha, 0)
+
+        # Tip ROI box
+        fh, fw = frame.shape[:2]
+        x0, x1 = int(fw * 0.3), int(fw * 0.7)
+        y0      = int(fh * 0.72)
+        box_col = (0, 200, 80) if self.on_sidewalk else (0, 0, 255)
+        cv2.rectangle(blended, (x0, y0), (x1, fh - 2), box_col, 2)
+
+        label = "ON SIDEWALK" if self.on_sidewalk else "OFF SIDEWALK!"
+        cv2.putText(blended, label, (x0, y0 - 8),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, box_col, 2)
+        return blended
+
+
+SIDEWALK_CHECK_EVERY = 5   # run SegFormer every N frames (heavier than YOLO)
 
 
 # ── Arduino serial ────────────────────────────────────────────────────────────
@@ -473,9 +551,11 @@ def main():
     parser.add_argument("--model",      default="yolov8n.pt")
     args = parser.parse_args()
 
-    model  = YOLO(args.model)
-    robot  = Robot(args.port)
-    warner = SpeechWarner()
+    model            = YOLO(args.model)
+    robot            = Robot(args.port)
+    warner           = SpeechWarner("Stop!")
+    sidewalk_warner  = SpeechWarner("Warning, you are leaving the sidewalk!", interval_s=3.0)
+    sidewalk_det     = SidewalkDetector()
 
     pipeline = rs.pipeline()
     cfg = rs.config()
@@ -577,8 +657,18 @@ def main():
             else:
                 robot.forward()
 
+            # ── Sidewalk detection (every N frames) ──────────────────────────
+            if frame_count % SIDEWALK_CHECK_EVERY == 0:
+                sidewalk_det.update(frame)
+
+            if not sidewalk_det.on_sidewalk:
+                sidewalk_warner.warn()
+
             # ── 2-D display ───────────────────────────────────────────────────
             if not args.no_display:
+                # Sidewalk segmentation overlay
+                frame = sidewalk_det.draw_overlay(frame)
+
                 # Zone lines
                 cv2.line(frame, (int(fw * LEFT_END),    0),
                                 (int(fw * LEFT_END),    fh), (180, 180, 0), 1)
