@@ -23,6 +23,8 @@ import serial
 import serial.tools.list_ports
 import websockets
 
+from realsense_obstacle import RealSenseObstacleMonitor
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)-7s  %(name)s  %(message)s",
@@ -34,19 +36,22 @@ logger = logging.getLogger("rpi")
 LAPTOP_WS_PORT = 8766
 BAUD_RATE      = 9600
 IMU_HZ         = 50     # rate at which IMU data is sent to laptop
+OBSTACLE_STOP_M = 2.0
+DEPTH_STALE_S = 1.0
 
 # ── Shared IMU state (written by reader thread, read by async loop) ────────────
 
 _imu = {"gx": 0.0, "gy": 0.0, "gz": 0.0, "ax": 0.0, "ay": 0.0, "az": 0.0}
 _imu_lock = threading.Lock()
+_obstacle_monitor = RealSenseObstacleMonitor(stop_distance_m=OBSTACLE_STOP_M)
 
 
 # ── RealSense IMU reader (background thread) ───────────────────────────────────
 
 def _imu_reader(pipeline: rs.pipeline) -> None:
     """
-    Reads gyro + accel frames from the RealSense D457 continuously.
-    Stores latest values in the shared _imu dict.
+    Reads gyro + accel + depth frames from the RealSense D457 continuously.
+    Stores latest IMU values in the shared _imu dict and updates obstacle state.
     """
     while True:
         try:
@@ -54,6 +59,7 @@ def _imu_reader(pipeline: rs.pipeline) -> None:
 
             gyro_frame  = frames.first_or_default(rs.stream.gyro)
             accel_frame = frames.first_or_default(rs.stream.accel)
+            depth_frame = frames.first_or_default(rs.stream.depth)
 
             with _imu_lock:
                 if gyro_frame:
@@ -68,6 +74,9 @@ def _imu_reader(pipeline: rs.pipeline) -> None:
                     _imu["ay"] = a.y
                     _imu["az"] = a.z
 
+            if depth_frame:
+                _obstacle_monitor.update_from_depth_frame(depth_frame)
+
         except Exception as exc:
             logger.warning(f"IMU read error: {exc}")
 
@@ -77,8 +86,9 @@ def _start_realsense() -> rs.pipeline:
     config   = rs.config()
     config.enable_stream(rs.stream.gyro,  rs.format.motion_xyz32f, 200)
     config.enable_stream(rs.stream.accel, rs.format.motion_xyz32f, 100)
+    config.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 15)
     pipeline.start(config)
-    logger.info("RealSense D457 IMU streams started")
+    logger.info("RealSense D457 IMU + depth streams started")
     return pipeline
 
 
@@ -142,6 +152,13 @@ async def _recv_commands(
             angle    = int(data.get("angle",    0)) % 360
             velocity = max(0,    min(100, int(data.get("velocity", 0))))
             rot      = max(-100, min(100, int(data.get("rot",      0))))
+            obstacle = _obstacle_monitor.snapshot()
+            obstacle_stale = (not obstacle.is_fresh) or (
+                (time.monotonic() - obstacle.timestamp) > DEPTH_STALE_S
+            )
+            if (obstacle_stale or obstacle.blocked) and (velocity > 0 or rot != 0):
+                arduino.write(b"S\n")
+                continue
             cmd      = f"{angle}|{velocity}|{rot}\n".encode("ascii")
             arduino.write(cmd)
 

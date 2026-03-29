@@ -48,6 +48,7 @@ import pyrealsense2 as rs
 import websockets
 
 from ble_driver import MiniAutoBLE
+from realsense_obstacle import RealSenseObstacleMonitor
 
 logging.basicConfig(
     level=logging.INFO,
@@ -63,6 +64,9 @@ PHONE_WS_PORT = 8765
 CONTROL_HZ  = 20
 NAV_AGE_S   = 2.0    # seconds before nav packet considered stale
 _RAD_TO_DEG = 180.0 / math.pi
+ARRIVAL_DISTANCE_M = 2.0
+OBSTACLE_STOP_M = 2.0
+DEPTH_STALE_S = 1.0
 
 
 # ── Shared state ───────────────────────────────────────────────────────────────
@@ -82,6 +86,7 @@ _nav_lock = threading.Lock()
 
 _gyro_z_dps: float = 0.0   # yaw rate in °/s — written by IMU thread
 _gyro_lock = threading.Lock()
+_obstacle_monitor = RealSenseObstacleMonitor(stop_distance_m=OBSTACLE_STOP_M)
 
 _phone_clients: set = set()
 
@@ -96,22 +101,26 @@ def _start_realsense() -> rs.pipeline:
     pipeline = rs.pipeline()
     config   = rs.config()
     config.enable_stream(rs.stream.gyro, rs.format.motion_xyz32f, 200)
+    config.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 15)
     pipeline.start(config)
-    logger.info("RealSense gyro stream started at 200 Hz")
+    logger.info("RealSense gyro + depth streams started")
     return pipeline
 
 
 def imu_reader(pipeline: rs.pipeline) -> None:
-    """Reads gyro Z from RealSense D457 and updates _gyro_z_dps."""
+    """Reads RealSense gyro + depth and updates shared safety state."""
     global _gyro_z_dps
     while True:
         try:
             frames = pipeline.wait_for_frames(timeout_ms=1000)
             gyro_frame = frames.first_or_default(rs.stream.gyro)
+            depth_frame = frames.first_or_default(rs.stream.depth)
             if gyro_frame:
                 g = gyro_frame.as_motion_frame().get_motion_data()
                 with _gyro_lock:
                     _gyro_z_dps = g.z * _RAD_TO_DEG   # rad/s → °/s
+            if depth_frame:
+                _obstacle_monitor.update_from_depth_frame(depth_frame)
         except Exception as exc:
             logger.warning(f"IMU read error: {exc}")
 
@@ -180,6 +189,7 @@ async def _control_loop(ble: MiniAutoBLE) -> None:
             nav = _latest_nav
         with _gyro_lock:
             gyro_z = _gyro_z_dps
+        obstacle = _obstacle_monitor.snapshot()
 
         # ── Stale / missing nav ───────────────────────────────────────────────
         if nav is None or (time.monotonic() - nav.received_at) > NAV_AGE_S:
@@ -190,8 +200,37 @@ async def _control_loop(ble: MiniAutoBLE) -> None:
             await asyncio.sleep(max(0.0, period - (time.monotonic() - t0)))
             continue
 
+        # ── Depth safety must be live before movement ─────────────────────────
+        if (not obstacle.is_fresh) or ((time.monotonic() - obstacle.timestamp) > DEPTH_STALE_S):
+            await send_ble(ble, "S\n")
+            logger.info("STOP — waiting for fresh RealSense depth")
+            await _broadcast_phone({
+                "type": "status",
+                "state": "depth_unavailable",
+                "heading_error": None,
+            })
+            await asyncio.sleep(max(0.0, period - (time.monotonic() - t0)))
+            continue
+
+        # ── Obstacle stop from RealSense depth ────────────────────────────────
+        if obstacle.blocked:
+            await send_ble(ble, "S\n")
+            logger.info(
+                "STOP — obstacle %.2fm ahead from RealSense depth",
+                obstacle.distance_m if obstacle.distance_m is not None else -1.0,
+            )
+            await _broadcast_phone({
+                "type": "status",
+                "state": "obstacle",
+                "heading_error": None,
+                "obstacle_distance": round(obstacle.distance_m, 2)
+                if obstacle.distance_m is not None else None,
+            })
+            await asyncio.sleep(max(0.0, period - (time.monotonic() - t0)))
+            continue
+
         # ── Arrived ───────────────────────────────────────────────────────────
-        if nav.distance is not None and nav.distance < 2.0:
+        if nav.distance is not None and nav.distance < ARRIVAL_DISTANCE_M:
             await send_ble(ble, "S\n")
             logger.info("STOP — arrived at destination")
             await _broadcast_phone({"type": "status", "state": "arrived",
