@@ -38,13 +38,13 @@ from ultralytics import YOLO
 STOP_DISTANCE_M  = 2.0   # obstacle closer than this triggers avoidance
 DRIVE_SPEED      = 70    # forward velocity (0–100)
 ARC_SPEED        = 80    # velocity while arcing (higher to compensate for rot halving it)
-ARC_ROT          = 35    # rotation magnitude while arcing (0–100); higher = tighter arc
+ARC_ROT          = 70    # rotation magnitude while arcing (0–100); higher = tighter arc
 BACK_SPEED       = 45    # reverse speed when fully blocked
 BACK_DURATION_S  = 0.5   # seconds to reverse before re-evaluating
 
 # Horizontal zones as fraction of frame width
-LEFT_END    = 0.35
-RIGHT_START = 0.65
+LEFT_END    = 0.25
+RIGHT_START = 0.75
 
 CONF_THRESH      = 0.45   # minimum YOLO confidence
 OBSTACLE_CLASSES = None   # None = all classes; e.g. {"person", "chair"}
