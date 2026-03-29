@@ -333,26 +333,23 @@ async def _scan():
 
 
 async def _test(device_name: str):
-    """Run a movement test sequence."""
+    """Run a movement test sequence using the leadme_firmware protocol."""
     print(f"Connecting to '{device_name}'...")
     async with MiniAutoBLE(device_name) as driver:
-        print("Connected. Running test sequence.")
-        for label, kwargs, duration in [
-            ("Forward",     dict(angle=0,   velocity=60), 2),
-            ("Strafe left", dict(angle=90,  velocity=60), 2),
-            ("Strafe right",dict(angle=270, velocity=60), 2),
-            ("Rotate CCW",  dict(angle=0,   velocity=0,  rot=50), 2),
-            ("Rotate CW",   dict(angle=0,   velocity=0,  rot=-50), 2),
+        print("Connected. Running test sequence (leadme_firmware protocol).")
+        for label, error, duration in [
+            ("Straight (error=0)",   0.0,   2),
+            ("Tug right (error=45)", 45.0,  2),
+            ("Tug left (error=-45)", -45.0, 2),
+            ("Hard right (error=90)",  90.0, 2),
+            ("Hard left (error=-90)", -90.0, 2),
         ]:
             print(f"  {label}...")
-            await driver.move(**kwargs)
+            await driver._send_raw(f"E:{error:.1f}:0.00\n".encode("ascii"))
             await asyncio.sleep(duration)
 
         await driver.stop()
-        print("Done. Last IMU reading:")
-        imu = driver.get_imu()
-        print(f"  Accel (g):  ax={imu.ax:.3f}  ay={imu.ay:.3f}  az={imu.az:.3f}")
-        print(f"  Gyro (°/s): gx={imu.gx:.2f}  gy={imu.gy:.2f}  gz={imu.gz:.2f}")
+        print("Done.")
 
 
 if __name__ == "__main__":

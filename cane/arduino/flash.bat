@@ -8,7 +8,7 @@ REM   flash.bat COM3         specify port explicitly
 
 setlocal EnableDelayedExpansion
 
-set SKETCH=%~dp0miniauto_firmware\miniauto_firmware.ino
+set SKETCH=%~dp0leadme_firmware\leadme_firmware.ino
 set BOARD=arduino:avr:uno
 set PORT=%1
 
