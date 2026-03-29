@@ -21,6 +21,9 @@ Requires:
     pip install pyrealsense2 ultralytics opencv-python pyserial matplotlib numpy
 """
 
+import os
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
 import argparse
 import io
 import tempfile
