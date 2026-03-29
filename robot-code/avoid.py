@@ -63,8 +63,7 @@ BAUD = 9600
 
 # ── Voice warning (ElevenLabs via lava.so) ────────────────────────────────────
 
-LAVA_API_KEY    = "aks_live_Xj5cToeOUuuLka5pePg_AFLp2Hsprn_C_mutwlSMEyve9M0i_K51P-n"
-LAVA_TTS_URL    = "https://api.lava.so/v1/text-to-speech/{voice_id}"
+LAVA_API_KEY     = "aks_live_Xj5cToeOUuuLka5pePg_AFLp2Hsprn_C_mutwlSMEyve9M0i_K51P-n"
 ELEVENLABS_VOICE = "21m00Tcm4TlvDq8ikWAM"   # Rachel — change to any ElevenLabs voice ID
 WARN_INTERVAL_S = 1.5   # minimum seconds between successive "stop" warnings
 
@@ -103,13 +102,28 @@ class SpeechWarner:
 
     def _speak(self):
         try:
-            url  = LAVA_TTS_URL.format(voice_id=ELEVENLABS_VOICE)
+            import base64, urllib.parse, json
+
+            # Build forward token: base64({"secret_key": "..."})
+            token = base64.b64encode(
+                json.dumps({"secret_key": LAVA_API_KEY}).encode()
+            ).decode()
+
+            # Target ElevenLabs URL, URL-encoded for the ?u= param
+            provider_url = (
+                f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE}"
+            )
+            forward_url = (
+                "https://api.lava.so/v1/forward?u="
+                + urllib.parse.quote(provider_url, safe="")
+            )
+
             resp = requests.post(
-                url,
+                forward_url,
                 headers={
-                    "xi-api-key":   LAVA_API_KEY,
-                    "Content-Type": "application/json",
-                    "Accept":       "audio/mpeg",
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type":  "application/json",
+                    "Accept":        "audio/mpeg",
                 },
                 json={
                     "text":     "Stop!",
