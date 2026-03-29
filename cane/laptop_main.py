@@ -3,15 +3,14 @@ LeadMe — Laptop Main
 Runs on the laptop. Replaces navigation.py + rpi_main.py.
 
 Flow:
-  Phone  (WebSocket :8765) ──► laptop_main.py ──► Arduino (USB Serial) ──► motors
-  RealSense D457 (USB) ──────► gyro reader ──────► serial payload
+  Phone  (WebSocket :8765) ──► laptop_main.py ──► Arduino (BLE / HM-10) ──► motors
+  RealSense D457 (USB) ──────► gyro reader ──────► BLE payload
 
-Serial protocol — laptop → Arduino (USB):
+BLE protocol — laptop → Arduino (Hiwonder miniAuto BLE module):
   "E:<heading_error>:<gyro_z>\\n"
     heading_error : -180.0 to +180.0 degrees
     gyro_z        : yaw rate in °/s (positive = turning CCW)
   "S\\n"   → stop immediately, reset PID
-  "P\\n"   → ping, Arduino responds "OK\\n"
 
 WebSocket protocol — phone → laptop (:8765):
   {
@@ -31,7 +30,8 @@ WebSocket protocol — laptop → phone (:8765):
   }
 
 Usage:
-    python laptop_main.py [--port /dev/ttyUSB0]
+    python laptop_main.py                        # auto-detect BLE device "Hiwonder"
+    python laptop_main.py --device "MyArduino"   # specify BLE device name
 """
 
 import argparse
@@ -45,9 +45,9 @@ from dataclasses import dataclass
 from typing import Optional
 
 import pyrealsense2 as rs
-import serial
-import serial.tools.list_ports
 import websockets
+
+from ble_driver import MiniAutoBLE
 
 logging.basicConfig(
     level=logging.INFO,
@@ -60,11 +60,9 @@ logger = logging.getLogger("laptop_main")
 PHONE_WS_HOST = "0.0.0.0"
 PHONE_WS_PORT = 8765
 
-SERIAL_BAUD   = 115200
-CONTROL_HZ    = 20
-
-NAV_AGE_S     = 2.0    # seconds before nav packet considered stale
-_RAD_TO_DEG   = 180.0 / math.pi
+CONTROL_HZ  = 20
+NAV_AGE_S   = 2.0    # seconds before nav packet considered stale
+_RAD_TO_DEG = 180.0 / math.pi
 
 
 # ── Shared state ───────────────────────────────────────────────────────────────
@@ -118,23 +116,13 @@ def imu_reader(pipeline: rs.pipeline) -> None:
             logger.warning(f"IMU read error: {exc}")
 
 
-# ── Serial helpers ─────────────────────────────────────────────────────────────
+# ── BLE send helper ───────────────────────────────────────────────────────────
 
-def find_arduino_port() -> Optional[str]:
-    keywords = {"arduino", "ch340", "ch341", "ftdi", "usbserial", "usbmodem", "acm"}
-    for p in serial.tools.list_ports.comports():
-        haystack = ((p.description or "") + (p.manufacturer or "") +
-                    (p.device or "")).lower()
-        if any(k in haystack for k in keywords):
-            return p.device
-    return None
-
-
-def send_serial(ser: serial.Serial, cmd: str) -> None:
+async def send_ble(ble: MiniAutoBLE, cmd: str) -> None:
     try:
-        ser.write(cmd.encode())
-    except serial.SerialException as exc:
-        logger.warning(f"Serial write failed: {exc}")
+        await ble._send_raw(cmd.encode("ascii"))
+    except Exception as exc:
+        logger.warning(f"BLE write failed: {exc}")
 
 
 # ── Phone WebSocket server (:8765) ────────────────────────────────────────────
@@ -181,7 +169,7 @@ async def _broadcast_phone(payload: dict) -> None:
 
 # ── Control loop (20 Hz) ──────────────────────────────────────────────────────
 
-async def _control_loop(ser: serial.Serial) -> None:
+async def _control_loop(ble: MiniAutoBLE) -> None:
     period = 1.0 / CONTROL_HZ
     logger.info(f"Control loop started at {CONTROL_HZ} Hz")
 
@@ -195,7 +183,7 @@ async def _control_loop(ser: serial.Serial) -> None:
 
         # ── Stale / missing nav ───────────────────────────────────────────────
         if nav is None or (time.monotonic() - nav.received_at) > NAV_AGE_S:
-            send_serial(ser, "S\n")
+            await send_ble(ble, "S\n")
             await _broadcast_phone({"type": "status", "state": "nav_stale",
                                     "heading_error": None})
             await asyncio.sleep(max(0.0, period - (time.monotonic() - t0)))
@@ -203,7 +191,7 @@ async def _control_loop(ser: serial.Serial) -> None:
 
         # ── Arrived ───────────────────────────────────────────────────────────
         if nav.distance is not None and nav.distance < 2.0:
-            send_serial(ser, "S\n")
+            await send_ble(ble, "S\n")
             await _broadcast_phone({"type": "status", "state": "arrived",
                                     "heading_error": 0.0})
             await asyncio.sleep(max(0.0, period - (time.monotonic() - t0)))
@@ -211,7 +199,7 @@ async def _control_loop(ser: serial.Serial) -> None:
 
         # ── No device heading yet ─────────────────────────────────────────────
         if nav.device_heading is None:
-            send_serial(ser, "S\n")
+            await send_ble(ble, "S\n")
             await _broadcast_phone({"type": "status", "state": "no_heading",
                                     "heading_error": None})
             await asyncio.sleep(max(0.0, period - (time.monotonic() - t0)))
@@ -220,7 +208,7 @@ async def _control_loop(ser: serial.Serial) -> None:
         # ── Send heading error + gyro — Arduino runs PID ──────────────────────
         heading_error = _normalize_angle(nav.target_bearing - nav.device_heading)
         cmd = f"E:{heading_error:.1f}:{gyro_z:.2f}\n"
-        send_serial(ser, cmd)
+        await send_ble(ble, cmd)
 
         logger.debug(
             f"target={nav.target_bearing:.1f}°  "
@@ -241,17 +229,9 @@ async def _control_loop(ser: serial.Serial) -> None:
 # ── Entry point ────────────────────────────────────────────────────────────────
 
 async def _async_main(args: argparse.Namespace) -> None:
-    # ── Serial ────────────────────────────────────────────────────────────────
-    port = args.port or find_arduino_port()
-    if not port:
-        logger.error("Arduino not found. Plug it in or pass --port /dev/ttyXXX")
-        return
-
-    logger.info(f"Opening serial port {port} @ {SERIAL_BAUD} baud…")
-    ser = serial.Serial(port, SERIAL_BAUD, timeout=1)
-    time.sleep(2)
-    send_serial(ser, "P\n")
-    logger.info("Arduino connected")
+    # ── BLE connection ────────────────────────────────────────────────────────
+    ble = MiniAutoBLE(device_name=args.device)
+    await ble.connect()
 
     # ── RealSense gyro ────────────────────────────────────────────────────────
     pipeline = _start_realsense()
@@ -262,7 +242,7 @@ async def _async_main(args: argparse.Namespace) -> None:
     phone_server = await websockets.serve(_phone_handler, PHONE_WS_HOST, PHONE_WS_PORT)
     logger.info(f"Phone WebSocket → ws://0.0.0.0:{PHONE_WS_PORT}")
 
-    control_task = asyncio.create_task(_control_loop(ser))
+    control_task = asyncio.create_task(_control_loop(ble))
 
     logger.info("Ready. Waiting for phone connection…")
     try:
@@ -271,18 +251,16 @@ async def _async_main(args: argparse.Namespace) -> None:
         pass
     finally:
         control_task.cancel()
-        send_serial(ser, "S\n")
+        await ble.disconnect()
         phone_server.close()
         pipeline.stop()
-        ser.close()
         logger.info("Shutdown complete")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="LeadMe laptop main process")
-    parser.add_argument("--port", default=None,
-                        help="Arduino serial port (auto-detected if omitted)")
-    args = parser.parse_args()
+    parser.add_argument("--device", default="Hiwonder",
+                        help="BLE device name to connect to (default: Hiwonder)")
 
     try:
         asyncio.run(_async_main(args))
