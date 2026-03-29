@@ -658,9 +658,9 @@ def main():
     model            = YOLO(args.model)
     robot            = Robot(args.port)
     warner           = SpeechWarner("Stop!")
-    sidewalk_warner  = SpeechWarner("Warning, you are leaving the sidewalk!", interval_s=3.0)
+    # sidewalk_warner  = SpeechWarner("Warning, you are leaving the sidewalk!", interval_s=3.0)
     ledge_warner     = SpeechWarner("Ledge detected!", interval_s=2.0)
-    sidewalk_det     = SidewalkDetector()
+    # sidewalk_det     = SidewalkDetector()
     ledge_det        = LedgeDetector(robot, ledge_warner)
 
     pipeline = rs.pipeline()
@@ -763,18 +763,11 @@ def main():
             else:
                 robot.forward()
 
-            # ── Sidewalk detection (every N frames) ──────────────────────────
-            if frame_count % SIDEWALK_CHECK_EVERY == 0:
-                sidewalk_det.put_frame(frame)
-
-            if not sidewalk_det.on_sidewalk:
-                sidewalk_warner.warn()
+            # sidewalk detection disabled (causes GIL crash on Windows with transformers)
 
             # ── 2-D display ───────────────────────────────────────────────────
             if not args.no_display:
                 # Sidewalk segmentation overlay
-                frame = sidewalk_det.draw_overlay(frame)
-
                 # Zone lines
                 cv2.line(frame, (int(fw * LEFT_END),    0),
                                 (int(fw * LEFT_END),    fh), (180, 180, 0), 1)
