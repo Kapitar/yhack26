@@ -184,6 +184,7 @@ async def _control_loop(ble: MiniAutoBLE) -> None:
         # ── Stale / missing nav ───────────────────────────────────────────────
         if nav is None or (time.monotonic() - nav.received_at) > NAV_AGE_S:
             await send_ble(ble, "S\n")
+            logger.info("STOP — no nav data from phone (start navigation in the app)")
             await _broadcast_phone({"type": "status", "state": "nav_stale",
                                     "heading_error": None})
             await asyncio.sleep(max(0.0, period - (time.monotonic() - t0)))
@@ -192,6 +193,7 @@ async def _control_loop(ble: MiniAutoBLE) -> None:
         # ── Arrived ───────────────────────────────────────────────────────────
         if nav.distance is not None and nav.distance < 2.0:
             await send_ble(ble, "S\n")
+            logger.info("STOP — arrived at destination")
             await _broadcast_phone({"type": "status", "state": "arrived",
                                     "heading_error": 0.0})
             await asyncio.sleep(max(0.0, period - (time.monotonic() - t0)))
@@ -200,6 +202,7 @@ async def _control_loop(ble: MiniAutoBLE) -> None:
         # ── No device heading yet ─────────────────────────────────────────────
         if nav.device_heading is None:
             await send_ble(ble, "S\n")
+            logger.info("STOP — no device heading (phone needs to be moving for GPS heading)")
             await _broadcast_phone({"type": "status", "state": "no_heading",
                                     "heading_error": None})
             await asyncio.sleep(max(0.0, period - (time.monotonic() - t0)))
@@ -210,10 +213,8 @@ async def _control_loop(ble: MiniAutoBLE) -> None:
         cmd = f"E:{heading_error:.1f}:{gyro_z:.2f}\n"
         await send_ble(ble, cmd)
 
-        logger.debug(
-            f"target={nav.target_bearing:.1f}°  "
-            f"heading={nav.device_heading:.1f}°  "
-            f"error={heading_error:+.1f}°  "
+        logger.info(
+            f"→ BLE  error={heading_error:+.1f}°  "
             f"gyro_z={gyro_z:+.1f}°/s  dist={nav.distance:.1f}m"
         )
 
