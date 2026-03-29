@@ -154,108 +154,6 @@ class SpeechWarner:
                 self._playing = False
 
 
-# ── Sidewalk detector ────────────────────────────────────────────────────────
-
-class SidewalkDetector:
-    """
-    Runs SegFormer (Cityscapes) in a dedicated background thread so PyTorch
-    never touches the GIL from the main thread.
-
-    Main thread calls put_frame() each time it wants a new result.
-    Read on_sidewalk / mask for the latest verdict (updated asynchronously).
-
-    Cityscapes class IDs: 0=road  1=sidewalk  2=building …
-    """
-
-    SIDEWALK_ID = 1
-    ROAD_ID     = 0
-    SAFE_IDS    = {0, 1}
-    MIN_RATIO   = 0.25
-    MODEL_NAME  = "nvidia/segformer-b0-finetuned-cityscapes-512-1024"
-
-    def __init__(self):
-        import queue
-        import torch
-        import torch.nn.functional as F
-        from transformers import (SegformerForSemanticSegmentation,
-                                  SegformerImageProcessor)
-
-        print("[sidewalk] loading SegFormer …")
-        self._processor = SegformerImageProcessor.from_pretrained(self.MODEL_NAME)
-        self._model     = SegformerForSemanticSegmentation.from_pretrained(self.MODEL_NAME)
-        self._model.eval()
-        self._torch     = torch
-        self._F         = F
-        print("[sidewalk] model ready")
-
-        self._queue      = queue.Queue(maxsize=1)
-        self._lock       = threading.Lock()
-        self.on_sidewalk = True
-        self.mask        = None
-
-        threading.Thread(target=self._worker, daemon=True).start()
-
-    def put_frame(self, frame: np.ndarray):
-        try:
-            try:
-                self._queue.get_nowait()
-            except Exception:
-                pass
-            self._queue.put_nowait(frame.copy())
-        except Exception:
-            pass
-
-    def _worker(self):
-        """Inference loop — model already loaded, no imports here."""
-        torch = self._torch
-        F     = self._F
-
-        while True:
-            frame = self._queue.get()
-
-            inputs = self._processor(images=frame, return_tensors="pt")
-            with torch.no_grad():
-                logits = self._model(**inputs).logits
-
-            up   = F.interpolate(logits, size=frame.shape[:2],
-                                 mode="bilinear", align_corners=False)
-            pred = up.argmax(dim=1).squeeze().numpy()
-            fh, fw = pred.shape
-
-            overlay = np.zeros((fh, fw, 3), dtype=np.uint8)
-            overlay[pred == self.SIDEWALK_ID] = (0, 200, 80)
-            overlay[pred == self.ROAD_ID]     = (200, 120, 0)
-
-            tip        = pred[int(fh * 0.72):, int(fw * 0.3):int(fw * 0.7)]
-            safe_ratio = np.isin(tip, list(self.SAFE_IDS)).mean()
-
-            with self._lock:
-                self.mask        = overlay
-                self.on_sidewalk = safe_ratio >= self.MIN_RATIO
-
-    def draw_overlay(self, frame: np.ndarray, alpha: float = 0.35) -> np.ndarray:
-        with self._lock:
-            mask        = self.mask
-            on_sidewalk = self.on_sidewalk
-
-        if mask is None:
-            return frame
-
-        blended = cv2.addWeighted(mask, alpha, frame, 1 - alpha, 0)
-
-        fh, fw  = frame.shape[:2]
-        x0, x1  = int(fw * 0.3), int(fw * 0.7)
-        y0       = int(fh * 0.72)
-        box_col  = (0, 200, 80) if on_sidewalk else (0, 0, 255)
-        cv2.rectangle(blended, (x0, y0), (x1, fh - 2), box_col, 2)
-        cv2.putText(blended,
-                    "ON SIDEWALK" if on_sidewalk else "OFF SIDEWALK!",
-                    (x0, y0 - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.65, box_col, 2)
-        return blended
-
-
-SIDEWALK_CHECK_EVERY = 5   # feed a frame to the worker every N frames
-
 # ── Ledge detector ────────────────────────────────────────────────────────────
 
 class LedgeDetector:
@@ -657,11 +555,9 @@ def main():
 
     model            = YOLO(args.model)
     robot            = Robot(args.port)
-    warner           = SpeechWarner("Stop!")
-    # sidewalk_warner  = SpeechWarner("Warning, you are leaving the sidewalk!", interval_s=3.0)
-    ledge_warner     = SpeechWarner("Ledge detected!", interval_s=2.0)
-    # sidewalk_det     = SidewalkDetector()
-    ledge_det        = LedgeDetector(robot, ledge_warner)
+    warner       = SpeechWarner("Stop!")
+    ledge_warner = SpeechWarner("Ledge detected!", interval_s=2.0)
+    ledge_det    = LedgeDetector(robot, ledge_warner)
 
     pipeline = rs.pipeline()
     cfg = rs.config()
@@ -763,11 +659,8 @@ def main():
             else:
                 robot.forward()
 
-            # sidewalk detection disabled (causes GIL crash on Windows with transformers)
-
             # ── 2-D display ───────────────────────────────────────────────────
             if not args.no_display:
-                # Sidewalk segmentation overlay
                 # Zone lines
                 cv2.line(frame, (int(fw * LEFT_END),    0),
                                 (int(fw * LEFT_END),    fh), (180, 180, 0), 1)
