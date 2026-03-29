@@ -102,12 +102,7 @@ class SpeechWarner:
 
     def _speak(self):
         try:
-            import base64, urllib.parse, json
-
-            # Build forward token: base64({"secret_key": "..."})
-            token = base64.b64encode(
-                json.dumps({"secret_key": LAVA_API_KEY}).encode()
-            ).decode()
+            import urllib.parse
 
             # Target ElevenLabs URL, URL-encoded for the ?u= param
             provider_url = (
@@ -121,7 +116,7 @@ class SpeechWarner:
             resp = requests.post(
                 forward_url,
                 headers={
-                    "Authorization": f"Bearer {token}",
+                    "Authorization": f"Bearer {LAVA_API_KEY}",
                     "Content-Type":  "application/json",
                     "Accept":        "audio/mpeg",
                 },
