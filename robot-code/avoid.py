@@ -21,12 +21,19 @@ Requires:
     pip install pyrealsense2 ultralytics opencv-python pyserial matplotlib numpy
 """
 
+import os
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
 import argparse
+import io
+import tempfile
+import threading
 import time
 
 import cv2
 import numpy as np
 import pyrealsense2 as rs
+import requests
 import serial
 import serial.tools.list_ports
 from ultralytics import YOLO
@@ -54,11 +61,251 @@ OBSTACLE_CLASSES = None
 
 BAUD = 9600
 
+# ── Voice warning (ElevenLabs via lava.so) ────────────────────────────────────
+
+LAVA_API_KEY     = "aks_live_Xj5cToeOUuuLka5pePg_AFLp2Hsprn_C_mutwlSMEyve9M0i_K51P-n"
+ELEVENLABS_VOICE = "21m00Tcm4TlvDq8ikWAM"   # Rachel — change to any ElevenLabs voice ID
+WARN_INTERVAL_S = 1.5   # minimum seconds between successive "stop" warnings
+
 # Approximate RealSense focal length (pixels) at 640×480
 FOCAL_PX = 600.0
 
 # How many frames between 3-D plot refreshes (matplotlib is slow)
 PLOT_3D_EVERY = 6
+
+
+# ── Speech warning ───────────────────────────────────────────────────────────
+
+class SpeechWarner:
+    """
+    Calls lava.so ElevenLabs TTS in a background thread.
+    Rate-limited per instance so obstacle and sidewalk warnings don't collide.
+    """
+
+    def __init__(self, message: str, interval_s: float = WARN_INTERVAL_S):
+        self._message     = message
+        self._interval_s  = interval_s
+        self._last_warned = 0.0
+        self._lock        = threading.Lock()
+        self._playing     = False
+
+    def warn(self):
+        now = time.monotonic()
+        with self._lock:
+            if self._playing:
+                return
+            if now - self._last_warned < self._interval_s:
+                return
+            self._last_warned = now
+            self._playing     = True
+
+        threading.Thread(target=self._speak, daemon=True).start()
+
+    def _speak(self):
+        try:
+            import urllib.parse
+
+            provider_url = (
+                f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE}"
+            )
+            forward_url = (
+                "https://api.lava.so/v1/forward?u="
+                + urllib.parse.quote(provider_url, safe="")
+            )
+
+            resp = requests.post(
+                forward_url,
+                headers={
+                    "Authorization": f"Bearer {LAVA_API_KEY}",
+                    "Content-Type":  "application/json",
+                    "Accept":        "audio/mpeg",
+                },
+                json={
+                    "text":     self._message,
+                    "model_id": "eleven_flash_v2",
+                    "voice_settings": {"stability": 0.4, "similarity_boost": 0.8},
+                },
+                timeout=8,
+            )
+            resp.raise_for_status()
+
+            # Write mp3 to a temp file and play with pygame
+            with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
+                f.write(resp.content)
+                tmp_path = f.name
+
+            import pygame
+            pygame.mixer.init()
+            pygame.mixer.music.load(tmp_path)
+            pygame.mixer.music.play()
+            while pygame.mixer.music.get_busy():
+                time.sleep(0.05)
+            pygame.mixer.music.unload()
+
+            import os
+            os.unlink(tmp_path)
+
+        except requests.HTTPError as e:
+            print(f"[speech] warning: {e} — {e.response.text}")
+        except Exception as e:
+            print(f"[speech] warning: {e}")
+        finally:
+            with self._lock:
+                self._playing = False
+
+
+# ── Sidewalk detector ────────────────────────────────────────────────────────
+
+class SidewalkDetector:
+    """
+    Runs SegFormer (Cityscapes) in a dedicated background thread so PyTorch
+    never touches the GIL from the main thread.
+
+    Main thread calls put_frame() each time it wants a new result.
+    Read on_sidewalk / mask for the latest verdict (updated asynchronously).
+
+    Cityscapes class IDs: 0=road  1=sidewalk  2=building …
+    """
+
+    SIDEWALK_ID = 1
+    ROAD_ID     = 0
+    SAFE_IDS    = {0, 1}
+    MIN_RATIO   = 0.25
+    MODEL_NAME  = "nvidia/segformer-b0-finetuned-cityscapes-512-1024"
+
+    def __init__(self):
+        import queue
+        self._queue      = queue.Queue(maxsize=1)   # drop old frames, keep latest
+        self._lock       = threading.Lock()
+        self.on_sidewalk = True
+        self.mask        = None
+
+        t = threading.Thread(target=self._worker, daemon=True)
+        t.start()
+
+    def put_frame(self, frame: np.ndarray):
+        """Non-blocking: drop the frame if the worker is still busy."""
+        try:
+            # Replace stale queued frame with the latest one
+            try:
+                self._queue.get_nowait()
+            except Exception:
+                pass
+            self._queue.put_nowait(frame.copy())
+        except Exception:
+            pass
+
+    def _worker(self):
+        """Runs entirely in its own thread — PyTorch stays here."""
+        print("[sidewalk] loading SegFormer …")
+        import torch
+        import torch.nn.functional as F
+        from transformers import (SegformerForSemanticSegmentation,
+                                  SegformerImageProcessor)
+
+        processor = SegformerImageProcessor.from_pretrained(self.MODEL_NAME)
+        model     = SegformerForSemanticSegmentation.from_pretrained(self.MODEL_NAME)
+        model.eval()
+        print("[sidewalk] model ready")
+
+        while True:
+            frame = self._queue.get()   # blocks until a frame arrives
+
+            inputs = processor(images=frame, return_tensors="pt")
+            with torch.no_grad():
+                logits = model(**inputs).logits
+
+            up   = F.interpolate(logits, size=frame.shape[:2],
+                                 mode="bilinear", align_corners=False)
+            pred = up.argmax(dim=1).squeeze().numpy()
+            fh, fw = pred.shape
+
+            overlay = np.zeros((fh, fw, 3), dtype=np.uint8)
+            overlay[pred == self.SIDEWALK_ID] = (0, 200, 80)
+            overlay[pred == self.ROAD_ID]     = (200, 120, 0)
+
+            tip        = pred[int(fh * 0.72):, int(fw * 0.3):int(fw * 0.7)]
+            safe_ratio = np.isin(tip, list(self.SAFE_IDS)).mean()
+
+            with self._lock:
+                self.mask        = overlay
+                self.on_sidewalk = safe_ratio >= self.MIN_RATIO
+
+    def draw_overlay(self, frame: np.ndarray, alpha: float = 0.35) -> np.ndarray:
+        with self._lock:
+            mask        = self.mask
+            on_sidewalk = self.on_sidewalk
+
+        if mask is None:
+            return frame
+
+        blended = cv2.addWeighted(mask, alpha, frame, 1 - alpha, 0)
+
+        fh, fw  = frame.shape[:2]
+        x0, x1  = int(fw * 0.3), int(fw * 0.7)
+        y0       = int(fh * 0.72)
+        box_col  = (0, 200, 80) if on_sidewalk else (0, 0, 255)
+        cv2.rectangle(blended, (x0, y0), (x1, fh - 2), box_col, 2)
+        cv2.putText(blended,
+                    "ON SIDEWALK" if on_sidewalk else "OFF SIDEWALK!",
+                    (x0, y0 - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.65, box_col, 2)
+        return blended
+
+
+SIDEWALK_CHECK_EVERY = 5   # feed a frame to the worker every N frames
+
+# ── Ledge detector ────────────────────────────────────────────────────────────
+
+class LedgeDetector:
+    """
+    Reads "D:<cm>" lines from the Arduino ultrasonic sensor in a background
+    thread. If the distance jumps by more than LEDGE_THRESHOLD_CM compared to
+    the rolling average, the ground dropped away — a ledge or step-down.
+    """
+
+    LEDGE_THRESHOLD_CM = 20   # sudden increase larger than this = ledge
+    HISTORY            = 5    # rolling average window
+
+    def __init__(self, serial_port: serial.Serial, warner: "SpeechWarner"):
+        self._ser           = serial_port
+        self._warner        = warner
+        self._lock          = threading.Lock()
+        self._readings: list[float] = []
+        self.ledge_detected = False
+
+        threading.Thread(target=self._reader, daemon=True).start()
+
+    def _reader(self):
+        buf = ""
+        while True:
+            try:
+                raw = self._ser.read(self._ser.in_waiting or 1)
+                if not raw:
+                    continue
+                buf += raw.decode("ascii", errors="ignore")
+                while "\n" in buf:
+                    line, buf = buf.split("\n", 1)
+                    line = line.strip()
+                    if line.startswith("D:"):
+                        try:
+                            self._process(float(line[2:]))
+                        except ValueError:
+                            pass
+            except Exception:
+                time.sleep(0.01)
+
+    def _process(self, dist: float):
+        with self._lock:
+            if self._readings:
+                avg = sum(self._readings) / len(self._readings)
+                if dist - avg > self.LEDGE_THRESHOLD_CM:
+                    self.ledge_detected = True
+                    self._warner.warn()
+                else:
+                    self.ledge_detected = False
+            self._readings.append(dist)
+            if len(self._readings) > self.HISTORY:
+                self._readings.pop(0)
 
 
 # ── Arduino serial ────────────────────────────────────────────────────────────
@@ -380,8 +627,13 @@ def main():
     parser.add_argument("--model",      default="yolov8n.pt")
     args = parser.parse_args()
 
-    model = YOLO(args.model)
-    robot = Robot(args.port)
+    model            = YOLO(args.model)
+    robot            = Robot(args.port)
+    warner           = SpeechWarner("Stop!")
+    sidewalk_warner  = SpeechWarner("Warning, you are leaving the sidewalk!", interval_s=3.0)
+    ledge_warner     = SpeechWarner("Ledge detected!", interval_s=2.0)
+    sidewalk_det     = SidewalkDetector()
+    ledge_det        = LedgeDetector(robot._ser, ledge_warner)
 
     pipeline = rs.pipeline()
     cfg = rs.config()
@@ -467,6 +719,7 @@ def main():
                 robot.backward()
                 action = "BACK UP"
             elif obstacle_ahead:
+                warner.warn()
                 left_dist  = zone_distance(depth_f, 0.0,        LEFT_END)
                 right_dist = zone_distance(depth_f, RIGHT_START, 1.0)
                 if left_dist >= right_dist:
@@ -482,8 +735,18 @@ def main():
             else:
                 robot.forward()
 
+            # ── Sidewalk detection (every N frames) ──────────────────────────
+            if frame_count % SIDEWALK_CHECK_EVERY == 0:
+                sidewalk_det.put_frame(frame)
+
+            if not sidewalk_det.on_sidewalk:
+                sidewalk_warner.warn()
+
             # ── 2-D display ───────────────────────────────────────────────────
             if not args.no_display:
+                # Sidewalk segmentation overlay
+                frame = sidewalk_det.draw_overlay(frame)
+
                 # Zone lines
                 cv2.line(frame, (int(fw * LEFT_END),    0),
                                 (int(fw * LEFT_END),    fh), (180, 180, 0), 1)
@@ -499,6 +762,10 @@ def main():
                             (0, 220,  80)
                 cv2.putText(frame, action, (10, fh - 15),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, txt_color, 2)
+
+                if ledge_det.ledge_detected:
+                    cv2.putText(frame, "⚠ LEDGE!", (fw - 160, 30),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
 
                 cv2.imshow("LeadMe Avoid", frame)
                 if cv2.waitKey(1) & 0xFF == ord("q"):
