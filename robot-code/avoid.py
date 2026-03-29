@@ -4,23 +4,21 @@ Runs YOLO object detection on the RealSense camera.
 When an obstacle is in the forward path, the robot arcs around it
 (forward + rotation) so overall forward progress is maintained.
 
+Visualization:
+  Window 1 — camera feed with YOLO boxes + A* path overlay (smooth bezier curves)
+  Window 2 — 3D matplotlib view: detected objects + 3D path curve
+
 Motor layout (front two wheels only):
     [0 LEFT] ─── [1 RIGHT]
 
-Serial protocol to main.cpp:
-    "angle|velocity|rot\\n"
-        angle    : 0 = forward, 180 = backward
-        velocity : 0–100
-        rot      : positive = arc left, negative = arc right
-
 Usage:
     python avoid.py                      # auto-detect Arduino port
-    python avoid.py --port COM3          # Windows
-    python avoid.py --port /dev/ttyACM0  # Linux/RPi
+    python avoid.py --port COM3
+    python avoid.py --port /dev/ttyACM0
     python avoid.py --no-display         # headless
 
 Requires:
-    pip install pyrealsense2 ultralytics opencv-python pyserial
+    pip install pyrealsense2 ultralytics opencv-python pyserial matplotlib numpy
 """
 
 import argparse
@@ -33,23 +31,34 @@ import serial
 import serial.tools.list_ports
 from ultralytics import YOLO
 
+import matplotlib
+matplotlib.use("TkAgg")
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D          # noqa: F401 (registers 3d projection)
+from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+
 # ── Tuning ────────────────────────────────────────────────────────────────────
 
-STOP_DISTANCE_M  = 2.0   # obstacle closer than this triggers avoidance
-DRIVE_SPEED      = 70    # forward velocity (0–100)
-ARC_SPEED        = 80    # velocity while arcing (higher to compensate for rot halving it)
-ARC_ROT          = 70    # rotation magnitude while arcing (0–100); higher = tighter arc
-BACK_SPEED       = 45    # reverse speed when fully blocked
-BACK_DURATION_S  = 0.5   # seconds to reverse before re-evaluating
+STOP_DISTANCE_M  = 2.0
+DRIVE_SPEED      = 70
+ARC_SPEED        = 80
+ARC_ROT          = 70
+BACK_SPEED       = 45
+BACK_DURATION_S  = 0.5
 
-# Horizontal zones as fraction of frame width
 LEFT_END    = 0.25
 RIGHT_START = 0.75
 
-CONF_THRESH      = 0.45   # minimum YOLO confidence
-OBSTACLE_CLASSES = None   # None = all classes; e.g. {"person", "chair"}
+CONF_THRESH      = 0.45
+OBSTACLE_CLASSES = None
 
 BAUD = 9600
+
+# Approximate RealSense focal length (pixels) at 640×480
+FOCAL_PX = 600.0
+
+# How many frames between 3-D plot refreshes (matplotlib is slow)
+PLOT_3D_EVERY = 6
 
 
 # ── Arduino serial ────────────────────────────────────────────────────────────
@@ -82,20 +91,10 @@ class Robot:
         line = f"{angle % 360}|{max(0, min(100, velocity))}|{max(-100, min(100, rot))}\n"
         self._ser.write(line.encode("ascii"))
 
-    def forward(self):
-        """Drive straight ahead."""
-        self._send(0, DRIVE_SPEED, 0)
-
-    def arc_left(self):
-        """Drive forward while curving left — avoids obstacle on the right side."""
-        self._send(0, ARC_SPEED, -ARC_ROT)
-
-    def arc_right(self):
-        """Drive forward while curving right — avoids obstacle on the left side."""
-        self._send(0, ARC_SPEED, ARC_ROT)
-
-    def backward(self):
-        self._send(180, BACK_SPEED, 0)
+    def forward(self):   self._send(0,   DRIVE_SPEED,  0)
+    def arc_left(self):  self._send(0,   ARC_SPEED,  -ARC_ROT)
+    def arc_right(self): self._send(0,   ARC_SPEED,   ARC_ROT)
+    def backward(self):  self._send(180, BACK_SPEED,   0)
 
     def stop(self):
         self._ser.write(b"S\n")
@@ -109,14 +108,10 @@ class Robot:
 
 def zone_distance(depth_frame, x0r: float, x1r: float,
                   y0r: float = 0.25, y1r: float = 0.75) -> float:
-    """10th-percentile distance (m) in a zone. Returns inf if no valid readings."""
     w = depth_frame.get_width()
     h = depth_frame.get_height()
-    xs = np.linspace(int(w * x0r), int(w * x1r), 7, dtype=int)
-    ys = np.linspace(int(h * y0r), int(h * y1r), 7, dtype=int)
-    # clamp so coordinates are always strictly inside the frame
-    xs = np.clip(xs, 0, w - 1)
-    ys = np.clip(ys, 0, h - 1)
+    xs = np.clip(np.linspace(int(w * x0r), int(w * x1r), 7, dtype=int), 0, w - 1)
+    ys = np.clip(np.linspace(int(h * y0r), int(h * y1r), 7, dtype=int), 0, h - 1)
     dists = [
         depth_frame.get_distance(int(x), int(y))
         for y in ys for x in xs
@@ -128,6 +123,254 @@ def zone_distance(depth_frame, x0r: float, x1r: float,
     return dists[max(0, int(len(dists) * 0.10))]
 
 
+# ── Bezier / path helpers ─────────────────────────────────────────────────────
+
+def cubic_bezier_2d(p0, p1, p2, p3, n: int = 80) -> np.ndarray:
+    """Return (n, 2) array of points along a cubic bezier curve."""
+    t  = np.linspace(0, 1, n)[:, None]
+    mt = 1 - t
+    return (mt**3 * p0 + 3 * mt**2 * t * p1
+            + 3 * mt * t**2 * p2 + t**3 * p3)
+
+
+def cubic_bezier_3d(p0, p1, p2, p3, n: int = 80) -> np.ndarray:
+    """Return (n, 3) array of points along a cubic bezier curve."""
+    t  = np.linspace(0, 1, n)[:, None]
+    mt = 1 - t
+    return (mt**3 * p0 + 3 * mt**2 * t * p1
+            + 3 * mt * t**2 * p2 + t**3 * p3)
+
+
+def draw_curve(img, pts, color, thickness=2, glow=True):
+    """Draw a smooth polyline; optionally add a soft glow underneath."""
+    pts_i = pts.astype(np.int32)
+    if glow:
+        cv2.polylines(img, [pts_i], False, color, thickness + 6, cv2.LINE_AA)
+        overlay = img.copy()
+        cv2.polylines(overlay, [pts_i], False, color, thickness + 6, cv2.LINE_AA)
+        cv2.addWeighted(overlay, 0.25, img, 0.75, 0, img)
+    cv2.polylines(img, [pts_i], False, color, thickness, cv2.LINE_AA)
+
+
+def draw_path_overlay(frame, action: str, obstacle_boxes: list):
+    """
+    Draw an A*-style planned path overlay on the frame.
+
+    obstacle_boxes : list of (x1,y1,x2,y2) for obstacles in the center zone.
+    action         : current robot action string.
+    """
+    fh, fw = frame.shape[:2]
+
+    # Robot position at bottom-centre, goal at top-centre
+    start = np.array([[fw / 2, fh - 10]], dtype=float)
+    goal  = np.array([[fw / 2, 10]],      dtype=float)
+
+    if action == "BACK UP":
+        # Dashed downward arrow
+        back_goal = np.array([[fw / 2, fh - 1]], dtype=float)
+        p1 = start + [0,  20]
+        p2 = back_goal + [0, -20]
+        pts = cubic_bezier_2d(start, p1, p2, back_goal)
+        draw_curve(frame, pts, (0, 60, 220), thickness=3, glow=True)
+        # Arrow head
+        cv2.arrowedLine(frame,
+                        (int(fw / 2), fh - 20), (int(fw / 2), fh - 5),
+                        (0, 60, 220), 3, tipLength=0.5)
+        return
+
+    if "ARC LEFT" in action or (not obstacle_boxes and action == "FORWARD"):
+        side_shift = -fw * 0.22 if "ARC LEFT" in action else 0.0
+    else:
+        side_shift = fw * 0.22 if "ARC RIGHT" in action else 0.0
+
+    if obstacle_boxes and action != "FORWARD":
+        # Use the nearest obstacle's bounding box to compute control points
+        # that pass cleanly to the side of it
+        ox1, oy1, ox2, oy2 = obstacle_boxes[0]
+        ocx = (ox1 + ox2) / 2.0
+        ocy = (oy1 + oy2) / 2.0
+
+        if "ARC LEFT" in action:
+            ctrl_x = ox1 - fw * 0.12          # pass to the left of the box
+        else:
+            ctrl_x = ox2 + fw * 0.12          # pass to the right
+
+        p1 = np.array([[fw / 2, fh * 0.7]])
+        p2 = np.array([[ctrl_x, ocy]])
+        p3 = goal + [side_shift, 0]
+        pts = cubic_bezier_2d(start, p1, p2, p3)
+    else:
+        # Straight or gentle forward path
+        p1 = start + [side_shift * 0.3, -(fh * 0.3)]
+        p2 = goal   + [side_shift * 0.7,  (fh * 0.3)]
+        pts = cubic_bezier_2d(start, p1, p2, goal)
+
+    path_color = (0, 220, 100) if action == "FORWARD" else (0, 160, 255)
+    draw_curve(frame, pts, path_color, thickness=3, glow=True)
+
+    # Draw animated chevrons along the path (every ~12th point)
+    for i in range(4, len(pts) - 4, 12):
+        p      = pts[i].astype(int)
+        ahead  = pts[min(i + 4, len(pts) - 1)].astype(int)
+        behind = pts[max(i - 4, 0)].astype(int)
+        angle  = np.degrees(np.arctan2(ahead[1] - behind[1],
+                                       ahead[0] - behind[0]))
+        cv2.circle(frame, tuple(p), 3, path_color, -1, cv2.LINE_AA)
+
+    # Goal marker
+    goal_i = goal.astype(int)[0]
+    cv2.circle(frame, tuple(goal_i), 8,  path_color, -1,  cv2.LINE_AA)
+    cv2.circle(frame, tuple(goal_i), 12, path_color,  2,  cv2.LINE_AA)
+
+    # Robot marker at bottom
+    start_i = start.astype(int)[0]
+    cv2.circle(frame, tuple(start_i), 8, (255, 255, 255), -1, cv2.LINE_AA)
+    cv2.circle(frame, tuple(start_i), 12, path_color, 2, cv2.LINE_AA)
+
+
+# ── 3-D coordinate helpers ────────────────────────────────────────────────────
+
+def pixel_to_3d(cx: float, cy: float, depth: float,
+                fw: int = 640, fh: int = 480) -> tuple:
+    """Back-project a pixel + depth to (X, Y, Z) in metres, robot-centred."""
+    x =  (cx - fw / 2) * depth / FOCAL_PX
+    y = -(cy - fh / 2) * depth / FOCAL_PX   # flip: up is +Y
+    z =  depth
+    return x, y, z
+
+
+def box_faces(cx, cy, cz, hw, hh, hd):
+    """Return 6 face vertex lists for a cuboid centred at (cx,cy,cz)."""
+    x0, x1 = cx - hw, cx + hw
+    y0, y1 = cy - hh, cy + hh
+    z0, z1 = cz - hd, cz + hd
+    return [
+        [[x0,y0,z0],[x1,y0,z0],[x1,y1,z0],[x0,y1,z0]],  # front
+        [[x0,y0,z1],[x1,y0,z1],[x1,y1,z1],[x0,y1,z1]],  # back
+        [[x0,y0,z0],[x0,y0,z1],[x0,y1,z1],[x0,y1,z0]],  # left
+        [[x1,y0,z0],[x1,y0,z1],[x1,y1,z1],[x1,y1,z0]],  # right
+        [[x0,y1,z0],[x1,y1,z0],[x1,y1,z1],[x0,y1,z1]],  # top
+        [[x0,y0,z0],[x1,y0,z0],[x1,y0,z1],[x0,y0,z1]],  # bottom
+    ]
+
+
+# ── 3-D plot setup ────────────────────────────────────────────────────────────
+
+def setup_3d_plot():
+    plt.ion()
+    fig = plt.figure("LeadMe 3D", figsize=(7, 6), facecolor="#0d0d0d")
+    ax  = fig.add_subplot(111, projection="3d")
+    ax.set_facecolor("#0d0d0d")
+    fig.subplots_adjust(left=0, right=1, bottom=0, top=1)
+    return fig, ax
+
+
+def update_3d_plot(ax, detections_3d: list, action: str):
+    """
+    detections_3d : list of dicts with keys:
+        label, x, y, z, w_m (half-width), h_m (half-height), d_m (half-depth), is_obstacle
+    action        : current robot action string
+    """
+    ax.cla()
+
+    # ── Styling ───────────────────────────────────────────────────────────────
+    ax.set_facecolor("#0d0d0d")
+    for pane in (ax.xaxis.pane, ax.yaxis.pane, ax.zaxis.pane):
+        pane.fill = False
+        pane.set_edgecolor("#333333")
+    ax.grid(True, color="#222222", linewidth=0.5)
+    ax.set_xlabel("X (m)", color="#888888", labelpad=6)
+    ax.set_ylabel("Z / depth (m)", color="#888888", labelpad=6)
+    ax.set_zlabel("Y (m)", color="#888888", labelpad=6)
+    ax.tick_params(colors="#555555")
+    for spine in ax.spines.values():
+        spine.set_edgecolor("#333333")
+
+    # Fixed axes so the view doesn't jump
+    ax.set_xlim(-3,  3)
+    ax.set_ylim( 0,  6)
+    ax.set_zlim(-2,  2)
+
+    # ── Floor grid ────────────────────────────────────────────────────────────
+    gx = np.linspace(-3, 3, 7)
+    gz = np.linspace( 0, 6, 7)
+    GX, GZ = np.meshgrid(gx, gz)
+    GY = np.zeros_like(GX) - 1.0
+    ax.plot_surface(GX, GZ, GY, alpha=0.07, color="#00ff88", linewidth=0)
+
+    # ── Robot marker at origin ────────────────────────────────────────────────
+    ax.scatter([0], [0], [0], c="#ffffff", s=80, zorder=5)
+    ax.quiver(0, 0, 0, 0, 0.6, 0, color="#00ffcc", linewidth=2,
+              arrow_length_ratio=0.3)
+    ax.text(0, 0, 0.12, "ROBOT", color="#00ffcc", fontsize=7,
+            ha="center", va="bottom")
+
+    # ── Obstacle boxes ────────────────────────────────────────────────────────
+    for det in detections_3d:
+        cx, cy, cz = det["x"], det["y"], det["z"]
+        hw, hh, hd = det["w_m"], det["h_m"], det["d_m"]
+        obstacle   = det["is_obstacle"]
+        face_color = "#ff3333" if obstacle else "#33aaff"
+        edge_color = "#ff6666" if obstacle else "#66ccff"
+
+        faces = box_faces(cx, cz, cy, hw, hd, hh)   # swap Y/Z for matplotlib
+        poly  = Poly3DCollection(faces, alpha=0.25,
+                                 facecolor=face_color, edgecolor=edge_color,
+                                 linewidth=0.6)
+        ax.add_collection3d(poly)
+
+        ax.text(cx, cz, cy + hh + 0.05, det["label"],
+                color="#ffffff", fontsize=7, ha="center", va="bottom")
+
+    # ── 3-D path curve ────────────────────────────────────────────────────────
+    if "ARC LEFT" in action:
+        side_x = -1.2
+    elif "ARC RIGHT" in action:
+        side_x =  1.2
+    elif "BACK UP" in action:
+        side_x =  0.0
+    else:
+        side_x =  0.0
+
+    goal_z = 5.0
+    if "BACK UP" in action:
+        p0 = np.array([[ 0.0,  0.0, 0.0]])
+        p1 = np.array([[ 0.0, -0.8, 0.0]])
+        p2 = np.array([[ 0.0, -1.5, 0.0]])
+        p3 = np.array([[ 0.0, -2.0, 0.0]])
+        path_color = "#ff3333"
+    else:
+        p0 = np.array([[ 0.0,   0.0, 0.0]])
+        p1 = np.array([[ side_x * 0.3, goal_z * 0.3, 0.0]])
+        p2 = np.array([[ side_x,       goal_z * 0.7, 0.0]])
+        p3 = np.array([[ side_x * 0.2, goal_z,       0.0]])
+        path_color = "#00ff88" if action == "FORWARD" else "#ffaa00"
+
+    curve = cubic_bezier_3d(p0, p1, p2, p3, n=100)
+    # curve columns: [x, z_world, y_world]
+    ax.plot(curve[:, 0], curve[:, 1], curve[:, 2],
+            color=path_color, linewidth=2.5, zorder=10)
+
+    # Chevron markers along path
+    for i in range(5, len(curve) - 5, 15):
+        ax.scatter(curve[i, 0], curve[i, 1], curve[i, 2],
+                   c=path_color, s=20, zorder=11)
+
+    # Goal marker
+    ax.scatter([p3[0, 0]], [p3[0, 1]], [p3[0, 2]],
+               c=path_color, s=80, marker="*", zorder=12)
+
+    action_colors = {"FORWARD": "#00ff88", "BACK UP": "#ff3333"}
+    color = action_colors.get(
+        next((k for k in action_colors if k in action), ""), "#ffaa00"
+    )
+    ax.set_title(f"  {action}", color=color, fontsize=9,
+                 loc="left", pad=4, fontweight="bold")
+
+    plt.draw()
+    plt.pause(0.001)
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
@@ -137,8 +380,8 @@ def main():
     parser.add_argument("--model",      default="yolov8n.pt")
     args = parser.parse_args()
 
-    model  = YOLO(args.model)
-    robot  = Robot(args.port)
+    model = YOLO(args.model)
+    robot = Robot(args.port)
 
     pipeline = rs.pipeline()
     cfg = rs.config()
@@ -147,10 +390,13 @@ def main():
     pipeline.start(cfg)
     align = rs.align(rs.stream.color)
 
+    if not args.no_display:
+        fig3d, ax3d = setup_3d_plot()
+
     print("[avoid] running — press Q to quit")
 
-    # Track backing manoeuvre so we don't interrupt it mid-reverse
     backing_until = 0.0
+    frame_count   = 0
 
     try:
         while True:
@@ -162,11 +408,14 @@ def main():
                 continue
 
             frame = np.asanyarray(color_f.get_data())
-            h, w  = frame.shape[:2]
+            fh, fw = frame.shape[:2]
+            frame_count += 1
 
-            # ── YOLO ─────────────────────────────────────────────────────────
+            # ── YOLO detection ────────────────────────────────────────────────
             results        = model(frame, verbose=False)
             obstacle_ahead = False
+            center_boxes   = []    # (x1,y1,x2,y2) of obstacles in center zone
+            detections_3d  = []    # dicts for 3-D plot
 
             for box in results[0].boxes:
                 conf = float(box.conf[0])
@@ -178,68 +427,86 @@ def main():
 
                 x1, y1, x2, y2 = map(int, box.xyxy[0])
                 cx, cy   = (x1 + x2) // 2, (y1 + y2) // 2
-                cx_ratio = cx / w
-                distance = depth_f.get_distance(cx, cy)
+                cx_ratio = cx / fw
+                distance = depth_f.get_distance(
+                    np.clip(cx, 0, fw - 1), np.clip(cy, 0, fh - 1)
+                )
                 in_center = LEFT_END <= cx_ratio <= RIGHT_START
                 is_close  = 0.6 < distance < STOP_DISTANCE_M
 
-                color = (0, 0, 255) if (in_center and is_close) else (0, 200, 0)
-                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+                box_color = (0, 0, 255) if (in_center and is_close) else (0, 200, 0)
+                cv2.rectangle(frame, (x1, y1), (x2, y2), box_color, 2)
                 cv2.putText(frame,
                             f"{label} {conf:.2f} {distance:.2f}m",
                             (x1, max(y1 - 8, 0)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, box_color, 2)
 
                 if in_center and is_close:
                     obstacle_ahead = True
+                    center_boxes.append((x1, y1, x2, y2))
+
+                # 3-D position
+                if 0.6 < distance < 8.0:
+                    ox, oy, oz = pixel_to_3d(cx, cy, distance, fw, fh)
+                    box_w_m = ((x2 - x1) / fw)  * distance
+                    box_h_m = ((y2 - y1) / fh)  * distance
+                    detections_3d.append({
+                        "label":       label,
+                        "x": ox, "y": oy, "z": oz,
+                        "w_m": box_w_m / 2,
+                        "h_m": box_h_m / 2,
+                        "d_m": 0.15,
+                        "is_obstacle": in_center and is_close,
+                    })
 
             # ── Avoidance decision ────────────────────────────────────────────
             now    = time.monotonic()
             action = "FORWARD"
 
             if now < backing_until:
-                # Finish reverse manoeuvre before doing anything else
                 robot.backward()
                 action = "BACK UP"
-
             elif obstacle_ahead:
                 left_dist  = zone_distance(depth_f, 0.0,        LEFT_END)
                 right_dist = zone_distance(depth_f, RIGHT_START, 1.0)
-
                 if left_dist >= right_dist:
-                    # More space on the left → arc left around the obstacle
                     robot.arc_left()
                     action = f"ARC LEFT  (L:{left_dist:.1f}m R:{right_dist:.1f}m)"
                 elif right_dist > left_dist:
-                    # More space on the right → arc right
                     robot.arc_right()
                     action = f"ARC RIGHT (L:{left_dist:.1f}m R:{right_dist:.1f}m)"
                 else:
-                    # Fully blocked — reverse briefly then try again
                     robot.backward()
                     backing_until = now + BACK_DURATION_S
                     action = "BACK UP"
-
             else:
                 robot.forward()
 
-            # ── Display ───────────────────────────────────────────────────────
+            # ── 2-D display ───────────────────────────────────────────────────
             if not args.no_display:
-                cv2.line(frame, (int(w * LEFT_END),    0),
-                                (int(w * LEFT_END),    h), (200, 200, 0), 1)
-                cv2.line(frame, (int(w * RIGHT_START), 0),
-                                (int(w * RIGHT_START), h), (200, 200, 0), 1)
+                # Zone lines
+                cv2.line(frame, (int(fw * LEFT_END),    0),
+                                (int(fw * LEFT_END),    fh), (180, 180, 0), 1)
+                cv2.line(frame, (int(fw * RIGHT_START), 0),
+                                (int(fw * RIGHT_START), fh), (180, 180, 0), 1)
 
-                color_map = {"FORWARD": (0, 255, 0)}
-                txt_color = (0, 165, 255) if "ARC" in action else \
-                            (0, 0, 255)   if "BACK" in action else \
-                            (0, 255, 0)
-                cv2.putText(frame, action, (10, h - 15),
+                # A* path overlay
+                draw_path_overlay(frame, action, center_boxes)
+
+                # Action label
+                txt_color = (0, 165, 255) if "ARC"  in action else \
+                            (0,   0, 255) if "BACK" in action else \
+                            (0, 220,  80)
+                cv2.putText(frame, action, (10, fh - 15),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, txt_color, 2)
 
                 cv2.imshow("LeadMe Avoid", frame)
                 if cv2.waitKey(1) & 0xFF == ord("q"):
                     break
+
+                # ── 3-D plot (throttled) ──────────────────────────────────────
+                if frame_count % PLOT_3D_EVERY == 0:
+                    update_3d_plot(ax3d, detections_3d, action)
 
     except KeyboardInterrupt:
         pass
@@ -247,6 +514,8 @@ def main():
         robot.close()
         pipeline.stop()
         cv2.destroyAllWindows()
+        if not args.no_display:
+            plt.close("all")
         print("[avoid] stopped")
 
 
