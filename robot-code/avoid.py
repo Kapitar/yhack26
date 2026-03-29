@@ -39,7 +39,7 @@ import serial.tools.list_ports
 from ultralytics import YOLO
 
 import matplotlib
-matplotlib.use("TkAgg")
+matplotlib.use("Agg")   # off-screen renderer — no Tk window, no GIL conflict
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D          # noqa: F401 (registers 3d projection)
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
@@ -353,15 +353,14 @@ def box_faces(cx, cy, cz, hw, hh, hd):
 # ── 3-D plot setup ────────────────────────────────────────────────────────────
 
 def setup_3d_plot():
-    plt.ion()
-    fig = plt.figure("LeadMe 3D", figsize=(7, 6), facecolor="#0d0d0d")
+    fig = plt.figure(figsize=(7, 6), facecolor="#0d0d0d")
     ax  = fig.add_subplot(111, projection="3d")
     ax.set_facecolor("#0d0d0d")
     fig.subplots_adjust(left=0, right=1, bottom=0, top=1)
     return fig, ax
 
 
-def update_3d_plot(ax, detections_3d: list, action: str):
+def update_3d_plot(fig, ax, detections_3d: list, action: str):
     """
     detections_3d : list of dicts with keys:
         label, x, y, z, w_m (half-width), h_m (half-height), d_m (half-depth), is_obstacle
@@ -463,8 +462,11 @@ def update_3d_plot(ax, detections_3d: list, action: str):
     ax.set_title(f"  {action}", color=color, fontsize=9,
                  loc="left", pad=4, fontweight="bold")
 
-    plt.draw()
-    plt.pause(0.001)
+    fig.canvas.draw()
+    buf = fig.canvas.tostring_rgb()
+    w, h = fig.canvas.get_width_height()
+    img = np.frombuffer(buf, dtype=np.uint8).reshape(h, w, 3)
+    cv2.imshow("LeadMe 3D", cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -604,7 +606,7 @@ def main():
 
                 # ── 3-D plot (throttled) ──────────────────────────────────────
                 if frame_count % PLOT_3D_EVERY == 0:
-                    update_3d_plot(ax3d, detections_3d, action)
+                    update_3d_plot(fig3d, ax3d, detections_3d, action)
 
     except KeyboardInterrupt:
         pass
@@ -612,8 +614,7 @@ def main():
         robot.close()
         pipeline.stop()
         cv2.destroyAllWindows()
-        if not args.no_display:
-            plt.close("all")
+        plt.close("all")
         print("[avoid] stopped")
 
 
