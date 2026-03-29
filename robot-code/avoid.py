@@ -113,6 +113,9 @@ def zone_distance(depth_frame, x0r: float, x1r: float,
     h = depth_frame.get_height()
     xs = np.linspace(int(w * x0r), int(w * x1r), 7, dtype=int)
     ys = np.linspace(int(h * y0r), int(h * y1r), 7, dtype=int)
+    # clamp so coordinates are always strictly inside the frame
+    xs = np.clip(xs, 0, w - 1)
+    ys = np.clip(ys, 0, h - 1)
     dists = [
         depth_frame.get_distance(int(x), int(y))
         for y in ys for x in xs
