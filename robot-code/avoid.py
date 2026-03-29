@@ -35,7 +35,7 @@ from ultralytics import YOLO
 
 # ── Tuning ────────────────────────────────────────────────────────────────────
 
-STOP_DISTANCE_M  = 1.2   # obstacle closer than this triggers avoidance
+STOP_DISTANCE_M  = 2.0   # obstacle closer than this triggers avoidance
 DRIVE_SPEED      = 70    # forward velocity (0–100)
 ARC_SPEED        = 80    # velocity while arcing (higher to compensate for rot halving it)
 ARC_ROT          = 35    # rotation magnitude while arcing (0–100); higher = tighter arc
@@ -119,7 +119,7 @@ def zone_distance(depth_frame, x0r: float, x1r: float,
     dists = [
         depth_frame.get_distance(int(x), int(y))
         for y in ys for x in xs
-        if 0.1 <= depth_frame.get_distance(int(x), int(y)) <= 8.0
+        if 0.6 <= depth_frame.get_distance(int(x), int(y)) <= 8.0
     ]
     if not dists:
         return float("inf")
@@ -180,7 +180,7 @@ def main():
                 cx_ratio = cx / w
                 distance = depth_f.get_distance(cx, cy)
                 in_center = LEFT_END <= cx_ratio <= RIGHT_START
-                is_close  = 0.1 < distance < STOP_DISTANCE_M
+                is_close  = 0.6 < distance < STOP_DISTANCE_M
 
                 color = (0, 0, 255) if (in_center and is_close) else (0, 200, 0)
                 cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
