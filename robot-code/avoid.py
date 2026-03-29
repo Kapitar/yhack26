@@ -463,10 +463,9 @@ def update_3d_plot(fig, ax, detections_3d: list, action: str):
                  loc="left", pad=4, fontweight="bold")
 
     fig.canvas.draw()
-    buf = fig.canvas.tostring_rgb()
     w, h = fig.canvas.get_width_height()
-    img = np.frombuffer(buf, dtype=np.uint8).reshape(h, w, 3)
-    cv2.imshow("LeadMe 3D", cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
+    img = np.frombuffer(fig.canvas.buffer_rgba(), dtype=np.uint8).reshape(h, w, 4)
+    cv2.imshow("LeadMe 3D", cv2.cvtColor(img, cv2.COLOR_RGBA2BGR))
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
