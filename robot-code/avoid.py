@@ -37,6 +37,7 @@ import requests
 import serial
 import serial.tools.list_ports
 from ultralytics import YOLO
+from staticmap import CircleMarker, Line, StaticMap
 
 import matplotlib
 matplotlib.use("Agg")   # off-screen renderer — no Tk window, no GIL conflict
@@ -72,6 +73,13 @@ FOCAL_PX = 600.0
 
 # How many frames between 3-D plot refreshes (matplotlib is slow)
 PLOT_3D_EVERY = 6
+
+# ── Map config ────────────────────────────────────────────────────────────────
+MAP_W      = 900
+MAP_H      = 700
+OSM_TILES  = "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
+NOMINATIM  = "https://nominatim.openstreetmap.org/search"
+OSRM_BASE  = "https://router.project-osrm.org/route/v1/foot/{lon1},{lat1};{lon2},{lat2}?overview=full&geometries=geojson"
 
 
 # ── Speech warning ───────────────────────────────────────────────────────────
@@ -152,6 +160,121 @@ class SpeechWarner:
         finally:
             with self._lock:
                 self._playing = False
+
+
+# ── Map viewer ───────────────────────────────────────────────────────────────
+
+class MapViewer:
+    """
+    Background thread: reads destination from stdin, fetches route from OSRM,
+    renders onto OSM tiles. Main thread calls get_frame() and shows with cv2.
+    Current location is auto-detected via IP geolocation.
+    """
+
+    def __init__(self):
+        self._lock  = threading.Lock()
+        self._frame = None          # BGR numpy image, set after each render
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def get_frame(self):
+        with self._lock:
+            return self._frame
+
+    # ── helpers ───────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _get_current_location():
+        try:
+            d = requests.get("http://ip-api.com/json/", timeout=5).json()
+            if d.get("status") == "success":
+                return d["lat"], d["lon"], d.get("city", "")
+        except Exception:
+            pass
+        return None
+
+    @staticmethod
+    def _geocode(place: str):
+        try:
+            results = requests.get(
+                NOMINATIM,
+                params={"q": place, "format": "json", "limit": 1},
+                headers={"User-Agent": "leadme-cane"},
+                timeout=10,
+            ).json()
+            if results:
+                return float(results[0]["lat"]), float(results[0]["lon"])
+        except Exception as e:
+            print(f"[map] geocode error: {e}")
+        return None
+
+    @staticmethod
+    def _get_route(start, end):
+        try:
+            url = OSRM_BASE.format(
+                lon1=start[1], lat1=start[0],
+                lon2=end[1],   lat2=end[0],
+            )
+            data = requests.get(url, timeout=15).json()
+            if data.get("code") != "Ok":
+                print(f"[map] OSRM: {data.get('message', data.get('code'))}")
+                return None, None
+            route = data["routes"][0]
+            coords = [(c[1], c[0]) for c in route["geometry"]["coordinates"]]
+            dist_km = route["distance"] / 1000
+            return coords, dist_km
+        except Exception as e:
+            print(f"[map] route error: {e}")
+            return None, None
+
+    def _render(self, route, start, end, dest_name, dist_km):
+        m = StaticMap(MAP_W, MAP_H, url_template=OSM_TILES)
+        m.add_line(Line([(lon, lat) for lat, lon in route], "#3388ff", 5))
+        m.add_marker(CircleMarker((start[1], start[0]), "#00cc44", 14))
+        m.add_marker(CircleMarker((end[1],   end[0]),   "#ff3333", 14))
+        img = cv2.cvtColor(np.array(m.render()), cv2.COLOR_RGB2BGR)
+        cv2.putText(img, f"To: {dest_name}  ({dist_km:.1f} km)",
+                    (12, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 0, 0),   4)
+        cv2.putText(img, f"To: {dest_name}  ({dist_km:.1f} km)",
+                    (12, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 255), 2)
+        with self._lock:
+            self._frame = img
+
+    # ── main thread ───────────────────────────────────────────────────────────
+
+    def _run(self):
+        print("\n[map] detecting current location via IP …")
+        loc_result = self._get_current_location()
+        if loc_result:
+            current_loc = (loc_result[0], loc_result[1])
+            print(f"[map] current location: {loc_result[2]} "
+                  f"({current_loc[0]:.4f}, {current_loc[1]:.4f})")
+        else:
+            print("[map] could not auto-detect location — map disabled")
+            return
+
+        print("[map] ready — type a destination in the terminal\n")
+        while True:
+            try:
+                dest = input("Destination: ").strip()
+            except EOFError:
+                break
+            if not dest:
+                continue
+
+            print(f"[map] geocoding '{dest}' …")
+            end = self._geocode(dest)
+            if not end:
+                print(f"[map] could not find: {dest}")
+                continue
+
+            print("[map] fetching route …")
+            route, dist_km = self._get_route(current_loc, end)
+            if not route:
+                continue
+
+            print("[map] rendering …")
+            self._render(route, current_loc, end, dest, dist_km)
+            print("[map] map updated\n")
 
 
 # ── Arduino serial ────────────────────────────────────────────────────────────
@@ -477,9 +600,10 @@ def main():
     parser.add_argument("--model",      default="yolov8n.pt")
     args = parser.parse_args()
 
-    model            = YOLO(args.model)
-    robot            = Robot(args.port)
-    warner = SpeechWarner("Stop!")
+    model      = YOLO(args.model)
+    robot      = Robot(args.port)
+    warner     = SpeechWarner("Stop!")
+    map_viewer = MapViewer()
 
     pipeline = rs.pipeline()
     cfg = rs.config()
@@ -600,6 +724,11 @@ def main():
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, txt_color, 2)
 
                 cv2.imshow("LeadMe Avoid", frame)
+
+                map_frame = map_viewer.get_frame()
+                if map_frame is not None:
+                    cv2.imshow("LeadMe Map", map_frame)
+
                 if cv2.waitKey(1) & 0xFF == ord("q"):
                     break
 
