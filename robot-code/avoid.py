@@ -175,18 +175,28 @@ class SidewalkDetector:
 
     def __init__(self):
         import queue
-        self._queue      = queue.Queue(maxsize=1)   # drop old frames, keep latest
+        import torch
+        import torch.nn.functional as F
+        from transformers import (SegformerForSemanticSegmentation,
+                                  SegformerImageProcessor)
+
+        print("[sidewalk] loading SegFormer …")
+        self._processor = SegformerImageProcessor.from_pretrained(self.MODEL_NAME)
+        self._model     = SegformerForSemanticSegmentation.from_pretrained(self.MODEL_NAME)
+        self._model.eval()
+        self._torch     = torch
+        self._F         = F
+        print("[sidewalk] model ready")
+
+        self._queue      = queue.Queue(maxsize=1)
         self._lock       = threading.Lock()
         self.on_sidewalk = True
         self.mask        = None
 
-        t = threading.Thread(target=self._worker, daemon=True)
-        t.start()
+        threading.Thread(target=self._worker, daemon=True).start()
 
     def put_frame(self, frame: np.ndarray):
-        """Non-blocking: drop the frame if the worker is still busy."""
         try:
-            # Replace stale queued frame with the latest one
             try:
                 self._queue.get_nowait()
             except Exception:
@@ -196,24 +206,16 @@ class SidewalkDetector:
             pass
 
     def _worker(self):
-        """Runs entirely in its own thread — PyTorch stays here."""
-        print("[sidewalk] loading SegFormer …")
-        import torch
-        import torch.nn.functional as F
-        from transformers import (SegformerForSemanticSegmentation,
-                                  SegformerImageProcessor)
-
-        processor = SegformerImageProcessor.from_pretrained(self.MODEL_NAME)
-        model     = SegformerForSemanticSegmentation.from_pretrained(self.MODEL_NAME)
-        model.eval()
-        print("[sidewalk] model ready")
+        """Inference loop — model already loaded, no imports here."""
+        torch = self._torch
+        F     = self._F
 
         while True:
-            frame = self._queue.get()   # blocks until a frame arrives
+            frame = self._queue.get()
 
-            inputs = processor(images=frame, return_tensors="pt")
+            inputs = self._processor(images=frame, return_tensors="pt")
             with torch.no_grad():
-                logits = model(**inputs).logits
+                logits = self._model(**inputs).logits
 
             up   = F.interpolate(logits, size=frame.shape[:2],
                                  mode="bilinear", align_corners=False)
