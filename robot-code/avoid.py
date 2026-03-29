@@ -158,78 +158,101 @@ class SpeechWarner:
 
 class SidewalkDetector:
     """
-    Uses SegFormer trained on Cityscapes to detect whether the cane tip area
-    is still on the sidewalk. Runs every SIDEWALK_CHECK_EVERY frames.
+    Runs SegFormer (Cityscapes) in a dedicated background thread so PyTorch
+    never touches the GIL from the main thread.
 
-    Cityscapes class IDs:
-        0 = road   1 = sidewalk   2 = building  ...
+    Main thread calls put_frame() each time it wants a new result.
+    Read on_sidewalk / mask for the latest verdict (updated asynchronously).
+
+    Cityscapes class IDs: 0=road  1=sidewalk  2=building …
     """
 
-    SIDEWALK_ID   = 1
-    ROAD_ID       = 0
-    SAFE_IDS      = {0, 1}          # road + sidewalk both count as "safe ground"
-    MIN_RATIO     = 0.25            # tip ROI must be ≥25% safe ground to stay "on"
-    MODEL_NAME    = "nvidia/segformer-b0-finetuned-cityscapes-512-1024"
+    SIDEWALK_ID = 1
+    ROAD_ID     = 0
+    SAFE_IDS    = {0, 1}
+    MIN_RATIO   = 0.25
+    MODEL_NAME  = "nvidia/segformer-b0-finetuned-cityscapes-512-1024"
 
     def __init__(self):
-        print("[sidewalk] loading SegFormer model …")
-        from transformers import SegformerForSemanticSegmentation, SegformerImageProcessor
+        import queue
+        self._queue      = queue.Queue(maxsize=1)   # drop old frames, keep latest
+        self._lock       = threading.Lock()
+        self.on_sidewalk = True
+        self.mask        = None
+
+        t = threading.Thread(target=self._worker, daemon=True)
+        t.start()
+
+    def put_frame(self, frame: np.ndarray):
+        """Non-blocking: drop the frame if the worker is still busy."""
+        try:
+            # Replace stale queued frame with the latest one
+            try:
+                self._queue.get_nowait()
+            except Exception:
+                pass
+            self._queue.put_nowait(frame.copy())
+        except Exception:
+            pass
+
+    def _worker(self):
+        """Runs entirely in its own thread — PyTorch stays here."""
+        print("[sidewalk] loading SegFormer …")
         import torch
-        self._torch     = torch
-        self._processor = SegformerImageProcessor.from_pretrained(self.MODEL_NAME)
-        self._model     = SegformerForSemanticSegmentation.from_pretrained(self.MODEL_NAME)
-        self._model.eval()
-        self.on_sidewalk = True       # latest verdict
-        self.mask        = None       # latest (H, W) uint8 overlay image
+        import torch.nn.functional as F
+        from transformers import (SegformerForSemanticSegmentation,
+                                  SegformerImageProcessor)
+
+        processor = SegformerImageProcessor.from_pretrained(self.MODEL_NAME)
+        model     = SegformerForSemanticSegmentation.from_pretrained(self.MODEL_NAME)
+        model.eval()
         print("[sidewalk] model ready")
 
-    def update(self, frame: np.ndarray):
-        """Run inference and update self.on_sidewalk + self.mask."""
-        import torch.nn.functional as F
+        while True:
+            frame = self._queue.get()   # blocks until a frame arrives
 
-        inputs = self._processor(images=frame, return_tensors="pt")
-        with self._torch.no_grad():
-            logits = self._model(**inputs).logits   # (1, 19, H/4, W/4)
+            inputs = processor(images=frame, return_tensors="pt")
+            with torch.no_grad():
+                logits = model(**inputs).logits
 
-        # Upsample to original frame size
-        up = F.interpolate(logits, size=frame.shape[:2],
-                           mode="bilinear", align_corners=False)
-        pred = up.argmax(dim=1).squeeze().numpy()   # (H, W)
+            up   = F.interpolate(logits, size=frame.shape[:2],
+                                 mode="bilinear", align_corners=False)
+            pred = up.argmax(dim=1).squeeze().numpy()
+            fh, fw = pred.shape
 
-        fh, fw = pred.shape
+            overlay = np.zeros((fh, fw, 3), dtype=np.uint8)
+            overlay[pred == self.SIDEWALK_ID] = (0, 200, 80)
+            overlay[pred == self.ROAD_ID]     = (200, 120, 0)
 
-        # Build colour overlay: sidewalk=green, road=blue, other=transparent
-        overlay = np.zeros((fh, fw, 3), dtype=np.uint8)
-        overlay[pred == self.SIDEWALK_ID] = (0, 200, 80)
-        overlay[pred == self.ROAD_ID]     = (200, 120, 0)
-        self.mask = overlay
+            tip        = pred[int(fh * 0.72):, int(fw * 0.3):int(fw * 0.7)]
+            safe_ratio = np.isin(tip, list(self.SAFE_IDS)).mean()
 
-        # Check the "cane tip" region: bottom-centre strip
-        tip = pred[int(fh * 0.72):, int(fw * 0.3):int(fw * 0.7)]
-        safe_ratio = np.isin(tip, list(self.SAFE_IDS)).mean()
-        self.on_sidewalk = safe_ratio >= self.MIN_RATIO
+            with self._lock:
+                self.mask        = overlay
+                self.on_sidewalk = safe_ratio >= self.MIN_RATIO
 
     def draw_overlay(self, frame: np.ndarray, alpha: float = 0.35) -> np.ndarray:
-        """Blend the segmentation mask onto frame and draw status text."""
-        if self.mask is None:
+        with self._lock:
+            mask        = self.mask
+            on_sidewalk = self.on_sidewalk
+
+        if mask is None:
             return frame
 
-        blended = cv2.addWeighted(self.mask, alpha, frame, 1 - alpha, 0)
+        blended = cv2.addWeighted(mask, alpha, frame, 1 - alpha, 0)
 
-        # Tip ROI box
-        fh, fw = frame.shape[:2]
-        x0, x1 = int(fw * 0.3), int(fw * 0.7)
-        y0      = int(fh * 0.72)
-        box_col = (0, 200, 80) if self.on_sidewalk else (0, 0, 255)
+        fh, fw  = frame.shape[:2]
+        x0, x1  = int(fw * 0.3), int(fw * 0.7)
+        y0       = int(fh * 0.72)
+        box_col  = (0, 200, 80) if on_sidewalk else (0, 0, 255)
         cv2.rectangle(blended, (x0, y0), (x1, fh - 2), box_col, 2)
-
-        label = "ON SIDEWALK" if self.on_sidewalk else "OFF SIDEWALK!"
-        cv2.putText(blended, label, (x0, y0 - 8),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, box_col, 2)
+        cv2.putText(blended,
+                    "ON SIDEWALK" if on_sidewalk else "OFF SIDEWALK!",
+                    (x0, y0 - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.65, box_col, 2)
         return blended
 
 
-SIDEWALK_CHECK_EVERY = 5   # run SegFormer every N frames (heavier than YOLO)
+SIDEWALK_CHECK_EVERY = 5   # feed a frame to the worker every N frames
 
 
 # ── Arduino serial ────────────────────────────────────────────────────────────
@@ -659,7 +682,7 @@ def main():
 
             # ── Sidewalk detection (every N frames) ──────────────────────────
             if frame_count % SIDEWALK_CHECK_EVERY == 0:
-                sidewalk_det.update(frame)
+                sidewalk_det.put_frame(frame)
 
             if not sidewalk_det.on_sidewalk:
                 sidewalk_warner.warn()
