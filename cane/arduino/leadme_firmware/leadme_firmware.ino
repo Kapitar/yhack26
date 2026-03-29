@@ -3,7 +3,7 @@
  *
  * Receives heading error from laptop over USB Serial.
  * Runs PID on-board to compute lateral correction force.
- * Drives 4-wheel omni-directional base via velocity_controller().
+ * Drives 2 front wheels (differential drive). Back motors unpopulated.
  *
  * ── Receive (laptop → Arduino via USB Serial) ────────────────────────────────
  *   "E:<heading_error>\n"   e.g. "E:13.5\n" or "E:-7.2\n"
@@ -72,20 +72,12 @@ void motors_set(int8_t m0, int8_t m1, int8_t m2, int8_t m3) {
     }
 }
 
-// angle: 0=forward, 90=strafe-left, 180=back, 270=strafe-right
-// velocity: 0–100, rot: -100 to +100
-void velocity_controller(uint16_t angle, uint8_t velocity, int8_t rot) {
-    angle += 90;
-    float rad   = angle * PI / 180.0f;
-    float speed = (rot == 0) ? 1.0f : 0.5f;
-    float vel   = velocity / sqrtf(2.0f);
-
-    int8_t vals[4];
-    vals[0] = (int8_t)constrain((vel * sinf(rad) - vel * cosf(rad)) * speed + rot * speed, -100, 100);
-    vals[1] = (int8_t)constrain((vel * sinf(rad) + vel * cosf(rad)) * speed - rot * speed, -100, 100);
-    vals[2] = (int8_t)constrain((vel * sinf(rad) - vel * cosf(rad)) * speed - rot * speed, -100, 100);
-    vals[3] = (int8_t)constrain((vel * sinf(rad) + vel * cosf(rad)) * speed + rot * speed, -100, 100);
-    motors_set(vals[0], vals[1], vals[2], vals[3]);
+// Differential drive — front-left (m0) and front-right (m1) only.
+// left  = base + correction  → correction > 0 turns right
+// right = base - correction  → correction < 0 turns left
+// Back motors (m2, m3) are unpopulated — always 0.
+void differential_drive(int8_t left, int8_t right) {
+    motors_set(left, right, 0, 0);
 }
 
 void stop_motors() {
@@ -125,34 +117,21 @@ float pid_compute(float error, float gyro_z_dps) {
 }
 
 
-// ── Map PID output to motor angle + speed ─────────────────────────────────────
+// ── Map PID correction to differential wheel speeds ───────────────────────────
 //
-// Mirrors the blend logic in the original navigation.py:
-//   correction > 0 → tug right  → angle blends toward 270°
-//   correction < 0 → tug left   → angle blends toward 90°
-//   forward bias always present (BASE_SPEED)
+//   correction > 0 → need to go right → left wheel faster, right slower
+//   correction < 0 → need to go left  → right wheel faster, left slower
+//
+// Both wheels always have a forward BASE_SPEED so the cane keeps moving.
 
 void apply_correction(float correction) {
-    float abs_corr = fabsf(correction);
+    int left  = (int)(BASE_SPEED + correction);
+    int right = (int)(BASE_SPEED - correction);
 
-    if (abs_corr < DEAD_ZONE_DEG) {
-        // Dead zone — just go straight forward
-        velocity_controller(0, BASE_SPEED, 0);
-        return;
-    }
+    left  = constrain(left,  -100, 100);
+    right = constrain(right, -100, 100);
 
-    int blend_angle;
-    if (correction >= 0.0f) {
-        // Tug right: 0° (forward) blending toward 270° (strafe-right)
-        blend_angle = (360 - (int)min(90.0f, abs_corr * 0.6f)) % 360;
-    } else {
-        // Tug left: 0° blending toward 90° (strafe-left)
-        blend_angle = (int)min(90.0f, abs_corr * 0.6f);
-    }
-
-    uint8_t tug_speed = (uint8_t)min(100, (int)(BASE_SPEED + abs_corr * 0.25f));
-
-    velocity_controller((uint16_t)blend_angle, tug_speed, 0);
+    differential_drive((int8_t)left, (int8_t)right);
 }
 
 
