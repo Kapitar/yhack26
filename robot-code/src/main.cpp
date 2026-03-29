@@ -15,112 +15,85 @@ const uint8_t pwm_min = 50;
 const uint8_t motorpwmPin[4]       = {10, 9, 6, 11};
 const uint8_t motordirectionPin[4] = {12, 8, 7, 13};
 
-// ─── SPEED (0–100) ────────────────────────────────────────────────────────────
-const uint8_t DRIVE_SPEED = 100;
-
-// ─── PAUSE BETWEEN MOVES (ms) ────────────────────────────────────────────────
-const uint16_t MOVE_GAP = 200;
+// ─── WATCHDOG ─────────────────────────────────────────────────────────────────
+// If no command is received within this many ms, stop motors (safety).
+const uint16_t WATCHDOG_MS = 500;
+unsigned long  lastCmdTime  = 0;
 
 // ─── FORWARD DECLARATIONS ────────────────────────────────────────────────────
 void Motor_Init(void);
 void Velocity_Controller(uint16_t angle, uint8_t velocity, int8_t rot, bool drift);
 void Motors_Set(int8_t M0, int8_t M1, int8_t M2, int8_t M3);
 void stopMotors(void);
-
-void goForward(uint16_t ms);
-void goBackward(uint16_t ms);
-void goLeft(uint16_t ms);
-void goRight(uint16_t ms);
-void goForwardLeft(uint16_t ms);
-void goForwardRight(uint16_t ms);
-void goBackwardLeft(uint16_t ms);
-void goBackwardRight(uint16_t ms);
-
-// ─────────────────────────────────────────────────────────────────────────────
-//  ★  MISSION — EDIT THIS SECTION TO SEQUENCE YOUR MOVES  ★
-//
-//  Each function takes a duration in milliseconds.
-//  Example: goForward(2000) = drive forward for 2 seconds.
-//
-//  Available functions:
-//    goForward(ms)        goBackward(ms)
-//    goLeft(ms)           goRight(ms)
-//    goForwardLeft(ms)    goForwardRight(ms)
-//    goBackwardLeft(ms)   goBackwardRight(ms)
-// ─────────────────────────────────────────────────────────────────────────────
-void mission() {
-    goForward(5000);          // forward  — tune ms for desired distance
-    goRight(5000);            // right    — tune ms for desired distance
-    goBackwardLeft(5000);     // bottom-left — tune ms for desired distance
-}
-// ─────────────────────────────────────────────────────────────────────────────
+void handleSerial(void);
 
 // ─── SETUP ───────────────────────────────────────────────────────────────────
 void setup() {
     Serial.begin(9600);
-    Serial.setTimeout(500);
+    Serial.setTimeout(100);
     Motor_Init();
-    mission();
-    stopMotors();
+    lastCmdTime = millis();
 }
 
-void loop() {}
+// ─── MAIN LOOP ───────────────────────────────────────────────────────────────
+void loop() {
+    handleSerial();
 
-// ─── 8 DIRECTION FUNCTIONS ───────────────────────────────────────────────────
-void goForward(uint16_t ms) {
-    Velocity_Controller(0, DRIVE_SPEED, 0, 0);
-    delay(ms);
-    stopMotors();
-    delay(MOVE_GAP);
+    // Watchdog: stop if host hasn't sent a command recently
+    if (millis() - lastCmdTime > WATCHDOG_MS) {
+        stopMotors();
+    }
 }
 
-void goBackward(uint16_t ms) {
-    Velocity_Controller(180, DRIVE_SPEED, 0, 0);
-    delay(ms);
-    stopMotors();
-    delay(MOVE_GAP);
-}
+// ─── SERIAL COMMAND HANDLER ──────────────────────────────────────────────────
+//
+//  Protocol (ASCII, newline-terminated):
+//    "P\n"                → ping, replies "OK\n"
+//    "S\n"                → emergency stop
+//    "angle|velocity|rot\n"  → move command
+//        angle    : 0–359  (0=forward, 90=left, 180=back, 270=right)
+//        velocity : 0–100
+//        rot      : -100–100 (CCW positive)
+//
+void handleSerial(void) {
+    if (!Serial.available()) return;
 
-void goLeft(uint16_t ms) {
-    Velocity_Controller(90, DRIVE_SPEED, 0, 0);
-    delay(ms);
-    stopMotors();
-    delay(MOVE_GAP);
-}
+    String line = Serial.readStringUntil('\n');
+    line.trim();
+    if (line.length() == 0) return;
 
-void goRight(uint16_t ms) {
-    Velocity_Controller(270, DRIVE_SPEED, 0, 0);
-    delay(ms);
-    stopMotors();
-    delay(MOVE_GAP);
-}
+    lastCmdTime = millis();
 
-void goForwardLeft(uint16_t ms) {
-    Velocity_Controller(45, DRIVE_SPEED, 0, 0);
-    delay(ms);
-    stopMotors();
-    delay(MOVE_GAP);
-}
+    // Ping
+    if (line == "P") {
+        Serial.println("OK");
+        return;
+    }
 
-void goForwardRight(uint16_t ms) {
-    Velocity_Controller(315, DRIVE_SPEED, 0, 0);
-    delay(ms);
-    stopMotors();
-    delay(MOVE_GAP);
-}
+    // Stop
+    if (line == "S") {
+        stopMotors();
+        return;
+    }
 
-void goBackwardLeft(uint16_t ms) {
-    Velocity_Controller(135, DRIVE_SPEED, 0, 0);
-    delay(ms);
-    stopMotors();
-    delay(MOVE_GAP);
-}
+    // Move: "angle|velocity|rot"
+    int sep1 = line.indexOf('|');
+    int sep2 = line.lastIndexOf('|');
+    if (sep1 < 0 || sep2 <= sep1) return;   // malformed
 
-void goBackwardRight(uint16_t ms) {
-    Velocity_Controller(225, DRIVE_SPEED, 0, 0);
-    delay(ms);
-    stopMotors();
-    delay(MOVE_GAP);
+    int angle    = line.substring(0, sep1).toInt();
+    int velocity = line.substring(sep1 + 1, sep2).toInt();
+    int rot      = line.substring(sep2 + 1).toInt();
+
+    angle    = ((angle % 360) + 360) % 360;
+    velocity = constrain(velocity, 0, 100);
+    rot      = constrain(rot, -100, 100);
+
+    if (velocity == 0 && rot == 0) {
+        stopMotors();
+    } else {
+        Velocity_Controller(angle, velocity, rot, false);
+    }
 }
 
 // ─── STOP ────────────────────────────────────────────────────────────────────
