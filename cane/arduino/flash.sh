@@ -1,14 +1,20 @@
 #!/bin/bash
-# LeadMe — Flash miniAuto firmware from Jetson Orin Nano
+# LeadMe — Flash Arduino firmware
 # Run this once whenever you update the Arduino sketch.
 #
 # Usage:
-#   ./flash.sh            # auto-detect Arduino port
-#   ./flash.sh /dev/ttyUSB0   # specify port explicitly
+#   ./flash.sh                        # flash leadme_firmware (default), auto-detect port
+#   ./flash.sh /dev/ttyUSB0           # specify port
+#   ./flash.sh /dev/ttyUSB0 miniauto  # flash legacy miniauto_firmware instead
 
 set -e
 
-SKETCH="$(dirname "$0")/miniauto_firmware/miniauto_firmware.ino"
+FIRMWARE="${2:-leadme}"
+if [ "$FIRMWARE" = "miniauto" ]; then
+    SKETCH="$(dirname "$0")/miniauto_firmware/miniauto_firmware.ino"
+else
+    SKETCH="$(dirname "$0")/leadme_firmware/leadme_firmware.ino"
+fi
 BOARD="arduino:avr:uno"
 PORT="${1:-}"
 
@@ -46,5 +52,5 @@ echo "Uploading to $PORT ..."
 arduino-cli upload --fqbn "$BOARD" --port "$PORT" "$SKETCH"
 
 echo ""
-echo "Done. miniAuto is running LeadMe firmware."
-echo "Test it: python3 cane/uart_driver.py $PORT"
+echo "Done. Arduino is running $(basename $SKETCH)."
+echo "Start the laptop process: python3 cane/laptop_main.py"
