@@ -127,7 +127,7 @@ class SpeechWarner:
                 },
                 json={
                     "text":     "Stop!",
-                    "model_id": "eleven_monolingual_v1",
+                    "model_id": "eleven_flash_v2",
                     "voice_settings": {"stability": 0.4, "similarity_boost": 0.8},
                 },
                 timeout=8,
@@ -152,6 +152,8 @@ class SpeechWarner:
             import os
             os.unlink(tmp_path)
 
+        except requests.HTTPError as e:
+            print(f"[speech] warning: {e} — {e.response.text}")
         except Exception as e:
             print(f"[speech] warning: {e}")
         finally:
