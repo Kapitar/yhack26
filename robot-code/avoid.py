@@ -254,6 +254,59 @@ class SidewalkDetector:
 
 SIDEWALK_CHECK_EVERY = 5   # feed a frame to the worker every N frames
 
+# ── Ledge detector ────────────────────────────────────────────────────────────
+
+class LedgeDetector:
+    """
+    Reads "D:<cm>" lines from the Arduino ultrasonic sensor in a background
+    thread. If the distance jumps by more than LEDGE_THRESHOLD_CM compared to
+    the rolling average, the ground dropped away — a ledge or step-down.
+    """
+
+    LEDGE_THRESHOLD_CM = 20   # sudden increase larger than this = ledge
+    HISTORY            = 5    # rolling average window
+
+    def __init__(self, serial_port: serial.Serial, warner: "SpeechWarner"):
+        self._ser           = serial_port
+        self._warner        = warner
+        self._lock          = threading.Lock()
+        self._readings: list[float] = []
+        self.ledge_detected = False
+
+        threading.Thread(target=self._reader, daemon=True).start()
+
+    def _reader(self):
+        buf = ""
+        while True:
+            try:
+                raw = self._ser.read(self._ser.in_waiting or 1)
+                if not raw:
+                    continue
+                buf += raw.decode("ascii", errors="ignore")
+                while "\n" in buf:
+                    line, buf = buf.split("\n", 1)
+                    line = line.strip()
+                    if line.startswith("D:"):
+                        try:
+                            self._process(float(line[2:]))
+                        except ValueError:
+                            pass
+            except Exception:
+                time.sleep(0.01)
+
+    def _process(self, dist: float):
+        with self._lock:
+            if self._readings:
+                avg = sum(self._readings) / len(self._readings)
+                if dist - avg > self.LEDGE_THRESHOLD_CM:
+                    self.ledge_detected = True
+                    self._warner.warn()
+                else:
+                    self.ledge_detected = False
+            self._readings.append(dist)
+            if len(self._readings) > self.HISTORY:
+                self._readings.pop(0)
+
 
 # ── Arduino serial ────────────────────────────────────────────────────────────
 
@@ -578,7 +631,9 @@ def main():
     robot            = Robot(args.port)
     warner           = SpeechWarner("Stop!")
     sidewalk_warner  = SpeechWarner("Warning, you are leaving the sidewalk!", interval_s=3.0)
+    ledge_warner     = SpeechWarner("Ledge detected!", interval_s=2.0)
     sidewalk_det     = SidewalkDetector()
+    ledge_det        = LedgeDetector(robot._ser, ledge_warner)
 
     pipeline = rs.pipeline()
     cfg = rs.config()
@@ -707,6 +762,10 @@ def main():
                             (0, 220,  80)
                 cv2.putText(frame, action, (10, fh - 15),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, txt_color, 2)
+
+                if ledge_det.ledge_detected:
+                    cv2.putText(frame, "⚠ LEDGE!", (fw - 160, 30),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
 
                 cv2.imshow("LeadMe Avoid", frame)
                 if cv2.waitKey(1) & 0xFF == ord("q"):

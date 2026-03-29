@@ -15,8 +15,13 @@ const uint8_t pwm_min = 50;
 const uint8_t motorpwmPin[4]       = {10, 9, 6, 11};
 const uint8_t motordirectionPin[4] = {12, 8, 7, 13};
 
+// ─── ULTRASONIC (HC-SR04) ─────────────────────────────────────────────────────
+const uint8_t  TRIG_PIN          = 3;
+const uint8_t  ECHO_PIN          = 2;
+const uint16_t DISTANCE_SEND_MS  = 80;   // send a reading every 80 ms
+unsigned long  lastDistanceSend  = 0;
+
 // ─── WATCHDOG ─────────────────────────────────────────────────────────────────
-// If no command is received within this many ms, stop motors (safety).
 const uint16_t WATCHDOG_MS = 500;
 unsigned long  lastCmdTime  = 0;
 
@@ -26,11 +31,14 @@ void Velocity_Controller(uint16_t angle, uint8_t velocity, int8_t rot, bool drif
 void Motors_Set(int8_t M0, int8_t M1, int8_t M2, int8_t M3);
 void stopMotors(void);
 void handleSerial(void);
+float readDistanceCM(void);
 
 // ─── SETUP ───────────────────────────────────────────────────────────────────
 void setup() {
     Serial.begin(9600);
     Serial.setTimeout(100);
+    pinMode(TRIG_PIN, OUTPUT);
+    pinMode(ECHO_PIN, INPUT);
     Motor_Init();
     lastCmdTime = millis();
 }
@@ -43,6 +51,29 @@ void loop() {
     if (millis() - lastCmdTime > WATCHDOG_MS) {
         stopMotors();
     }
+
+    // Send ultrasonic distance to host
+    if (millis() - lastDistanceSend >= DISTANCE_SEND_MS) {
+        float dist = readDistanceCM();
+        if (dist > 0) {
+            Serial.print("D:");
+            Serial.println(dist, 1);
+        }
+        lastDistanceSend = millis();
+    }
+}
+
+// ─── ULTRASONIC READ ──────────────────────────────────────────────────────────
+// Returns distance in cm, or -1 on timeout (no echo).
+float readDistanceCM(void) {
+    digitalWrite(TRIG_PIN, LOW);
+    delayMicroseconds(2);
+    digitalWrite(TRIG_PIN, HIGH);
+    delayMicroseconds(10);
+    digitalWrite(TRIG_PIN, LOW);
+    long duration = pulseIn(ECHO_PIN, HIGH, 30000UL);  // 30 ms timeout ≈ 5 m max
+    if (duration == 0) return -1;
+    return (duration * 0.034f) / 2.0f;
 }
 
 // ─── SERIAL COMMAND HANDLER ──────────────────────────────────────────────────
