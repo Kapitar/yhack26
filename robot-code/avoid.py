@@ -62,7 +62,8 @@ def find_arduino() -> str | None:
                ("arduino", "ch340", "ch341", "ftdi", "usb serial")):
             return p.device
     for p in serial.tools.list_ports.comports():
-        if "ttyUSB" in p.device or "ttyACM" in p.device:
+        if any(k in p.device for k in
+               ("ttyUSB", "ttyACM", "cu.usbmodem", "cu.usbserial")):
             return p.device
     return None
 
@@ -87,11 +88,11 @@ class Robot:
 
     def arc_left(self):
         """Drive forward while curving left — avoids obstacle on the right side."""
-        self._send(0, ARC_SPEED, ARC_ROT)
+        self._send(0, ARC_SPEED, -ARC_ROT)
 
     def arc_right(self):
         """Drive forward while curving right — avoids obstacle on the left side."""
-        self._send(0, ARC_SPEED, -ARC_ROT)
+        self._send(0, ARC_SPEED, ARC_ROT)
 
     def backward(self):
         self._send(180, BACK_SPEED, 0)
