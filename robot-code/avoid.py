@@ -129,20 +129,18 @@ class SpeechWarner:
             )
             resp.raise_for_status()
 
-            # Write mp3 to a temp file and play with the OS audio player
+            # Write mp3 to a temp file and play with pygame
             with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
                 f.write(resp.content)
                 tmp_path = f.name
 
-            import subprocess, platform
-            system = platform.system()
-            if system == "Darwin":
-                subprocess.run(["afplay", tmp_path], check=True)
-            elif system == "Linux":
-                subprocess.run(["mpg123", "-q", tmp_path], check=True)
-            else:  # Windows
-                import winsound
-                winsound.PlaySound(tmp_path, winsound.SND_FILENAME)
+            import pygame
+            pygame.mixer.init()
+            pygame.mixer.music.load(tmp_path)
+            pygame.mixer.music.play()
+            while pygame.mixer.music.get_busy():
+                time.sleep(0.05)
+            pygame.mixer.music.unload()
 
             import os
             os.unlink(tmp_path)
